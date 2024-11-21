@@ -1,0 +1,9 @@
+ninja
+cmake
+wheel
+pybind11
+triton @ "git+ssh://git@github.com/triton-lang/triton.git@main#subdirectory=python"
+pytest
+torch
+numpy
+matplotlib
