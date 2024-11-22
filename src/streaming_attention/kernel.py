@@ -20,6 +20,10 @@ MAX_TILE_SIZE = 256
 MIN_TILE_SIZE = 32
 
 
+def strides(t):
+    return [t.stride(i) for i in range(t.ndim)]
+
+
 def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     min_size = min(CONTEXT_SIZE, 64)
     max_size = CONTEXT_SIZE * 4
@@ -453,7 +457,7 @@ def _streaming_attn_bwd(
             block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
             order=(0, 1),
         )
-        tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty), boundary_check=0)
+        tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty), boundary_check=(0,))
 
         dvbatch_head_offset = batch * stride_dvb + head * stride_dvh
         dv_tile_ptr = tl.make_block_ptr(
@@ -464,7 +468,7 @@ def _streaming_attn_bwd(
             block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
             order=(0, 1),
         )
-        tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=0)
+        tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=(0,))
 
 
 @triton.jit
@@ -495,28 +499,33 @@ def _streaming_attn_bwd_dkdv(
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
     kv_context_indices = kv_indices // CONTEXT_SIZE
 
+    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5), dk.dtype)
+
     for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
         qT = tl.load(
             tl.advance(qt_tile_ptr, (0, q_token_idx)),
             boundary_check=(1,),
+            padding_option='zero',
         )
         m = tl.load(
             tl.advance(lse_tile_ptr, (q_token_idx,)),
             boundary_check=(0,),
+            padding_option='zero',
         )
+        tl.static_assert(m.dtype == tl.float32)
+
         qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         pT = tl.math.exp2(qkT - m[None, :])
-
 
         q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
         q_context_indices = q_tile_indices // CONTEXT_SIZE
         mask = (
-            kv_indices[None, :] < seq_len
+            kv_indices[:, None] < seq_len
         ) & (
-            q_tile_indices[:, None] < seq_len
+            q_tile_indices[None, :] < seq_len
         )
-        blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
+        blocks_diff = q_context_indices[None, :] - kv_context_indices[:, None]
         streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
         mask &= streaming_mask
         pT = tl.where(mask, pT, 0.0)
@@ -524,19 +533,24 @@ def _streaming_attn_bwd_dkdv(
         do = tl.load(
             tl.advance(do_tile_ptr, (q_token_idx, 0)),
             boundary_check=(0,),
+            padding_option='zero',
         )
 
-        dv += tl.dot(pT.to(do.dtype), do)
+        dv = tl.dot(pT.to(do.dtype), do, dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(
             tl.advance(delta_tile_ptr, (q_token_idx,)),
+            boundary_check=(0,),
+            padding_option='zero',
         )
+        tl.static_assert(Di.dtype == tl.float32)
+        tl.device_assert(tl.sum(Di != Di).sum() == 0)
+
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dk += tl.dot(dsT.to(qT.dtype), tl.trans(qT))
+        dk = tl.dot(dsT.to(qT.dtype), tl.trans(qT), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
 
-    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5), dk.dtype)
     dk *= softmax_scale
     return dk, dv
 
@@ -556,7 +570,7 @@ class StreamingAttention(torch.autograd.Function):
         else:
             lens = torch.as_tensor(lens, dtype=torch.int32)
 
-        assert lens is None or (lens.dtype == torch.int32 and batch == len(lens))
+        assert lens is None or (lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1)
 
         O = torch.empty_like(q, memory_format=torch.contiguous_format)
         LSE = torch.empty(q.shape[:3], dtype=torch.float32, device=q.device)
@@ -604,12 +618,10 @@ class StreamingAttention(torch.autograd.Function):
         q, k, v, o, lse, lens = ctx.saved_tensors
         batch, heads, T, HEAD_DIM = q.shape
 
-        print(torch.isnan(lse).sum())
-
-        delta = (o * do.float()).sum(-1).contiguous()
-        DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
-        DK = torch.empty_like(k, memory_format=torch.contiguous_format)
-        DV = torch.empty_like(v, memory_format=torch.contiguous_format)
+        delta = (o * do.float()).sum(-1)
+        DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
+        DK = torch.zeros_like(k, memory_format=torch.contiguous_format)
+        DV = torch.zeros_like(v, memory_format=torch.contiguous_format)
 
         grid = lambda args: (
             batch,
@@ -621,17 +633,17 @@ class StreamingAttention(torch.autograd.Function):
             q, k, v, lens,
             delta, lse, o,
             do, DQ, DK, DV,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            delta.stride(0), delta.stride(1), delta.stride(2),
-            lse.stride(0), lse.stride(1), lse.stride(2),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-            DQ.stride(0), DQ.stride(1), DQ.stride(2), DQ.stride(3),
-            DK.stride(0), DK.stride(1), DK.stride(2), DK.stride(3),
-            DV.stride(0), DV.stride(1), DV.stride(2), DV.stride(3),
-            lens.stride(0),
+            *strides(q),
+            *strides(k),
+            *strides(v),
+            *strides(delta),
+            *strides(lse),
+            *strides(o),
+            *strides(do),
+            *strides(DQ),
+            *strides(DK),
+            *strides(DV),
+            *strides(lens),
             T=T,
             BATCH=batch,
             HEAD_DIM=HEAD_DIM,
