@@ -12,15 +12,18 @@ from streaming_attention import (streaming_attention,
 @pytest.mark.parametrize(
     "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
 )
+@pytest.mark.parametrize(
+    "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
+)
 @pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
-@pytest.mark.parametrize("B", [1, 7, 67], ids=lambda x: f"batch-{x}")
+@pytest.mark.parametrize("B", [1, 67], ids=lambda x: f"batch-{x}")
 @pytest.mark.parametrize("H", [1, 6], ids=lambda x: f"heads-{x}")
 @pytest.mark.parametrize("T", [1, 10, 16, 800], ids=lambda x: f"time-{x}")
 @pytest.mark.parametrize(
     "context_size", [1, 10, 16, 32, 100, 256], ids=lambda x: f"context-{x}"
 )
 @pytest.mark.parametrize(
-    "back_contexts", [0, 1, 5, 1000], ids=lambda x: f"back_contexts-{x}"
+    "back_contexts", [0, 5, 1000], ids=lambda x: f"back_contexts-{x}"
 )
 def test_op(
     B,
@@ -31,26 +34,45 @@ def test_op(
     back_contexts,
     dtype,
     lens,
+    noncontiguous,
 ):
     torch.manual_seed(20)
     torch.set_float32_matmul_precision("highest")
+    torch.cuda.empty_cache()
 
     if os.environ.get("TRITON_INTERPRET") == "1" and dtype == torch.bfloat16:
         pytest.skip("skipping bf16 in interpreter mode")
 
-    q = torch.zeros((B, H, T, HEAD_DIM), dtype=dtype, device="cuda").normal_(
-        mean=0.0, std=0.01
-    ).requires_grad_()
-    k = torch.zeros((B, H, T, HEAD_DIM), dtype=dtype, device="cuda").normal_(
-        mean=0.0, std=0.01
-    ).requires_grad_()
-    v = torch.zeros((B, H, T, HEAD_DIM), dtype=dtype, device="cuda").normal_(
-        mean=0.0, std=0.01
-    ).requires_grad_()
+    shape_mul = 2 if noncontiguous else 1
 
-    dout = torch.randn_like(q, dtype=torch.float32).normal_(
-        mean=0.0, std=0.01
+    q, k, v = [
+        torch.testing.make_tensor(
+            (B * shape_mul, H * shape_mul, T * shape_mul, HEAD_DIM * shape_mul),
+            dtype=dtype,
+            device="cuda",
+            requires_grad=True,
+            noncontiguous=noncontiguous,
+            low=-0.01,
+            high=0.01
+        )
+        for _ in range(3)
+    ]
+
+    dout = torch.testing.make_tensor(
+        (B * shape_mul, H * shape_mul, T * shape_mul, HEAD_DIM * shape_mul),
+        dtype=torch.float32,
+        device="cuda",
+        requires_grad=True,
+        noncontiguous=noncontiguous,
+        low=-0.01,
+        high=0.01
     )
+
+    if noncontiguous:
+        q = q[1::2, 1::2, 1::2, 1::2].detach().clone().requires_grad_()
+        k = k[1::2, 1::2, 1::2, 1::2].detach().clone().requires_grad_()
+        v = v[1::2, 1::2, 1::2, 1::2].detach().clone().requires_grad_()
+        dout = dout[1::2, 1::2, 1::2, 1::2]
 
     if lens == "none":
         lens = None

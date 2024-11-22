@@ -222,7 +222,6 @@ def _streaming_attn_fwd(
             boundary_check=(0,),
         )
 
-    # lg2(e) temperatire adjustment
     softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5) * RCP_LN2, q_tile.dtype)
 
     for kv_tile_idx in tl.range(
