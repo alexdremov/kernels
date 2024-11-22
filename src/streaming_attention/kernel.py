@@ -765,7 +765,7 @@ def _streaming_attn_bwd_dq(
         min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
     )
 
-    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5) * RCP_LN2, tl.float32)
+    softmax_scale: tl.constexpr = tl.cast(RCP_LN2, q.dtype)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
     q_context_indices = q_tile_indices // CONTEXT_SIZE

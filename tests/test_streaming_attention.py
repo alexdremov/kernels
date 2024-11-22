@@ -112,10 +112,13 @@ def test_op(
         b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
         h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()
 
+        mask = res_mask.broadcast_to(tri_out.shape)
+        mean_err = (abs(d_ref[mask].to(torch.float32) - d_tri[mask].to(torch.float32)).mean() * 1000).item()
+
         torch.testing.assert_close(
             d_tri,
             d_ref,
             atol=atol,
             rtol=0,
-            msg=lambda x: f"error in d{'kvq'[i]}\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(d_tri - d_ref)[errors].view(-1)}\n\nlens:\n{lens}"
+            msg=lambda x: f"error in d{'kvq'[i]}\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(d_tri - d_ref)[errors].view(-1)}\n\nlens:\n{lens}\n{mean_err = }"
         )
