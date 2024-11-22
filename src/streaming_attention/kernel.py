@@ -308,19 +308,53 @@ def _streaming_attn_fwd(
             )
 
 
-@triton.heuristics(
-    dict(
-        TILE_DQ_Q_SIZE=lambda _: 16,
-        TILE_DQ_K_SIZE=lambda _: 16,
-        TILE_DK_Q_SIZE=lambda _: 16,
-        TILE_DK_K_SIZE=lambda _: 16,
-
+@triton_no_tests_autotune(
+    autotune=dict(
+        configs=[
+            triton.Config(
+                dict(
+                    PIPELINING=pipe,
+                    TILE_DQ_Q_SIZE=tile_qq,
+                    TILE_DQ_K_SIZE=tile_qk,
+                    TILE_DK_Q_SIZE=tile_kq,
+                    TILE_DK_K_SIZE=tile_kk,
+                ),
+                num_warps=num_warps,
+                num_stages=pipe,
+            )
+            for num_warps in [4, 8]
+            for pipe in [1, 2, 3]
+            for tile_qq in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+            for tile_qk in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+            for tile_kq in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+            for tile_kk in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+        ],
+        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
+        prune_configs_by=dict(
+            early_config_prune=fwd_configs_pruner
+        )
+    ),
+    heuristics=dict(
+        PIPELINING=lambda _: 1,
+        TILE_DQ_Q_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+        ),
+        TILE_DQ_K_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+        ),
+        TILE_DK_Q_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+        ),
+        TILE_DK_K_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+        ),
     )
 )
 @triton.heuristics(
     dict(
         RCP_LN2=lambda _: math.log2(math.e),
         DQ_TILES_NUM=lambda args: triton.cdiv(args['T'], args["TILE_DQ_Q_SIZE"]),
+        PERFECT_DKV_MATCHING=lambda args : args['TILE_DK_Q_SIZE'] == args['TILE_DK_K_SIZE'] and args['TILE_DK_K_SIZE'] == args['CONTEXT_SIZE'],
     )
 )
 @triton.jit
@@ -351,6 +385,9 @@ def _streaming_attn_bwd(
     PRESCALE_QK: tl.constexpr,  #
     DTYPE: tl.constexpr,  #
     RCP_LN2: tl.constexpr,  #
+    PERFECT_DKV_MATCHING: tl.constexpr,  #
+    PIPELINING: tl.constexpr,  #
+    TIME_BUCKET: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -451,6 +488,8 @@ def _streaming_attn_bwd(
             TILE_K_SIZE=TILE_DK_K_SIZE,
             INPUT_PRECISION=INPUT_PRECISION,
             RCP_LN2=RCP_LN2,
+            PERFECT_MATCHING=PERFECT_DKV_MATCHING,
+            PIPELINING=PIPELINING,
         )
 
         dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
@@ -489,7 +528,9 @@ def _streaming_attn_bwd_dkdv(
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    RCP_LN2,
+    RCP_LN2: tl.constexpr,
+    PERFECT_MATCHING: tl.constexpr,
+    PIPELINING: tl.constexpr,
 ):
     kv_tile_min_context = kv_token_idx // CONTEXT_SIZE
     q_start_tile_idx = (kv_tile_min_context * CONTEXT_SIZE) // TILE_Q_SIZE
@@ -506,7 +547,7 @@ def _streaming_attn_bwd_dkdv(
 
     softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5), dk.dtype)
 
-    for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx):
+    for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
         qT = tl.load(
             tl.advance(qt_tile_ptr, (0, q_token_idx)),
@@ -524,15 +565,16 @@ def _streaming_attn_bwd_dkdv(
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
-        q_context_indices = q_tile_indices // CONTEXT_SIZE
         mask = (
             kv_indices[:, None] < seq_len
         ) & (
             q_tile_indices[None, :] < seq_len
         )
-        blocks_diff = q_context_indices[None, :] - kv_context_indices[:, None]
-        streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
-        mask &= streaming_mask
+        if not PERFECT_MATCHING:
+            q_context_indices = q_tile_indices // CONTEXT_SIZE
+            blocks_diff = q_context_indices[None, :] - kv_context_indices[:, None]
+            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
+            mask &= streaming_mask
         pT = tl.where(mask, pT, 0.0)
 
         do = tl.load(
@@ -589,16 +631,16 @@ class StreamingAttention(torch.autograd.Function):
 
         kt = k.transpose(-1, -2)  # just stride tricks, same data
         _streaming_attn_fwd[grid](
-            q, kt, v, lens, #
-            LSE, O,  #
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
-            kt.stride(0), kt.stride(1), kt.stride(2), kt.stride(3),  #
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
-            LSE.stride(0), LSE.stride(1), LSE.stride(2),  #
-            stride_ob=O.stride(0), stride_oh=O.stride(1), stride_ot=O.stride(2), stride_ok=O.stride(3),  #
-            lens_stride=lens.stride(0),
+            q, kt, v, lens,
+            LSE, O,
+            *strides(q),
+            *strides(kt),
+            *strides(v),
+            *strides(LSE),
+            *strides(O),
+            *strides(lens),
             T=T,
-            HEAD_DIM=HEAD_DIM,  #
+            HEAD_DIM=HEAD_DIM,
             CONTEXT_SIZE=context_size,
             CONTEXTS_BACK=back_contexts,
             INPUT_PRECISION=(
@@ -654,6 +696,7 @@ class StreamingAttention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM,
             CONTEXT_SIZE=ctx.context_size,
             CONTEXTS_BACK=ctx.back_contexts,
+            TIME_BUCKET=triton.next_power_of_2(T),
             INPUT_PRECISION=(
                 "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
             ),
