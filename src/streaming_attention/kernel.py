@@ -443,6 +443,9 @@ def _streaming_attn_bwd_precompute(
         RCP_LN2=lambda _: math.log2(math.e),
         DQ_TILES_NUM=lambda args: triton.cdiv(args['T'], args["TILE_DQ_Q_SIZE"]),
         PERFECT_DKV_MATCHING=lambda args : args['TILE_DK_Q_SIZE'] == args['TILE_DK_K_SIZE'] and args['TILE_DK_K_SIZE'] == args['CONTEXT_SIZE'],
+        PERFECT_DQ_MATCHING=lambda args : args['TILE_DQ_Q_SIZE'] == args['TILE_DQ_K_SIZE'] and args['TILE_DQ_K_SIZE'] == args['CONTEXT_SIZE'],
+        DQ_Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DQ_Q_SIZE'] == 0,
+        DQ_K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DQ_K_SIZE'] == 0,
         DK_Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DK_Q_SIZE'] == 0,
         DK_K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DK_K_SIZE'] == 0,
     )
@@ -450,14 +453,13 @@ def _streaming_attn_bwd_precompute(
 @triton.jit
 def _streaming_attn_bwd(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, L: tl.tensor, #
-    DELTA: tl.tensor, LSE: tl.tensor, O: tl.tensor,  #
+    DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
     stride_deltab: int, stride_deltah: int, stride_deltat: int,  #
     stride_mb: int, stride_mh: int, stride_mt: int,  #
-    stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int,  #
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,  #
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,  #
     stride_dkb: int, stride_dkh: int, stride_dkt: int, stride_dkk: int,  #
@@ -476,8 +478,11 @@ def _streaming_attn_bwd(
     DTYPE: tl.constexpr,  #
     RCP_LN2: tl.constexpr,  #
     PERFECT_DKV_MATCHING: tl.constexpr,  #
+    PERFECT_DQ_MATCHING: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     TIME_BUCKET: tl.constexpr,  #
+    DQ_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
+    DQ_K_BLOCK_DIVISIBLE: tl.constexpr,  #
     DK_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     DK_K_BLOCK_DIVISIBLE: tl.constexpr,  #
 ):
@@ -619,6 +624,192 @@ def _streaming_attn_bwd(
             tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty))
         else:
             tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=(0,))
+    else:
+        q_tile_idx = tile_id
+        q_token_idx = q_tile_idx * TILE_DQ_Q_SIZE
+
+        qbatch_head_offset = batch * stride_qb + head * stride_qh
+        q_tile_ptr = tl.make_block_ptr(
+            base=Q + qbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_qt, stride_qk),
+            offsets=(q_token_idx, 0),
+            block_shape=(TILE_DQ_Q_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+        if DQ_Q_BLOCK_DIVISIBLE:
+            q = tl.load(q_tile_ptr)
+        else:
+            q = tl.load(q_tile_ptr, boundary_check=(0,))
+
+        lsebatch_head_offset = batch * stride_mb + head * stride_mh
+        lse_tile_ptr = tl.make_block_ptr(
+            base=LSE + lsebatch_head_offset,
+            shape=(T,),
+            strides=(stride_mt,),
+            offsets=(0,),
+            block_shape=(TILE_DQ_Q_SIZE,),
+            order=(0,),
+        )
+        if DQ_Q_BLOCK_DIVISIBLE:
+            m = tl.load(lse_tile_ptr)[:, None]
+        else:
+            m = tl.load(lse_tile_ptr, boundary_check=(0,))[:, None]
+
+        delta_tile_ptr = batch * stride_deltab + head * stride_deltah
+        delta_tile_ptr = tl.make_block_ptr(
+            base=DELTA + delta_tile_ptr,
+            shape=(T,),
+            strides=(stride_deltat,),
+            offsets=(0,),
+            block_shape=(TILE_DQ_Q_SIZE,),
+            order=(0,),
+        )
+        if DQ_Q_BLOCK_DIVISIBLE:
+            di = tl.load(delta_tile_ptr)
+        else:
+            di = tl.load(delta_tile_ptr, boundary_check=(0,))
+
+        dobatch_head_offset = batch * stride_dob + head * stride_doh
+        do_tile_ptr = tl.make_block_ptr(
+            base=DO + dobatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dot, stride_dok),
+            offsets=(q_token_idx, 0),
+            block_shape=(TILE_DQ_Q_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+        if DQ_Q_BLOCK_DIVISIBLE:
+            do = tl.load(do_tile_ptr)
+        else:
+            do = tl.load(do_tile_ptr, boundary_check=(0,))
+
+        kbatch_head_offset = batch * stride_kb + head * stride_kh
+        kt_tile_ptr = tl.make_block_ptr(
+            base=K + kbatch_head_offset,
+            shape=(HEAD_DIM, T),
+            strides=(stride_kk, stride_kt),
+            offsets=(0, 0),
+            block_shape=(HEAD_DIM, TILE_DQ_K_SIZE),
+            order=(1, 0),
+        )
+
+        vbatch_head_offset = batch * stride_vb + head * stride_vh
+        vt_tile_ptr = tl.make_block_ptr(
+            base=V + vbatch_head_offset,
+            shape=(HEAD_DIM, T),
+            strides=(stride_vk, stride_vt),
+            offsets=(0, 0),
+            block_shape=(HEAD_DIM, TILE_DQ_K_SIZE),
+            order=(1, 0),
+        )
+
+        dq = tl.zeros([TILE_DQ_Q_SIZE, HEAD_DIM], dtype=tl.float32)
+        dq = _streaming_attn_bwd_dq(
+            dq, q, m, di, do,
+            kt_tile_ptr, vt_tile_ptr,
+            seq_len=seq_len,
+            q_token_idx=q_token_idx,
+            HEAD_DIM=HEAD_DIM,
+            CONTEXT_SIZE=CONTEXT_SIZE,
+            CONTEXTS_BACK=CONTEXTS_BACK,
+            TILE_Q_SIZE=TILE_DQ_Q_SIZE,
+            TILE_K_SIZE=TILE_DQ_K_SIZE,
+            INPUT_PRECISION=INPUT_PRECISION,
+            PIPELINING=PIPELINING,
+            K_BLOCK_DIVISIBLE=DQ_K_BLOCK_DIVISIBLE,
+            PERFECT_MATCHING=PERFECT_DQ_MATCHING,
+            RCP_LN2=RCP_LN2,
+        )
+
+        dqbatch_head_offset = batch * stride_dqb + head * stride_dqh
+        dq_tile_ptr = tl.make_block_ptr(
+            base=DQ + dqbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dqt, stride_dqk),
+            offsets=(q_token_idx, 0),
+            block_shape=(TILE_DQ_Q_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+        if DQ_Q_BLOCK_DIVISIBLE:
+            tl.store(dq_tile_ptr, dq)
+        else:
+            tl.store(dq_tile_ptr, dq, boundary_check=(0,))
+
+
+@triton.jit
+def _streaming_attn_bwd_dq(
+    dq, q, m, di, do,
+    kt_tile_ptr, vt_tile_ptr,
+    seq_len,
+    q_token_idx,
+    HEAD_DIM: tl.constexpr,
+    CONTEXT_SIZE: tl.constexpr,
+    CONTEXTS_BACK: tl.constexpr,
+    TILE_Q_SIZE: tl.constexpr,
+    TILE_K_SIZE: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+    PERFECT_MATCHING: tl.constexpr,
+    PIPELINING: tl.constexpr,
+    K_BLOCK_DIVISIBLE: tl.constexpr,
+    RCP_LN2: tl.constexpr,
+):
+    q_tile_min_context = q_token_idx // CONTEXT_SIZE
+    kv_start_tile_idx = max(
+        0, ((q_tile_min_context - CONTEXTS_BACK) * CONTEXT_SIZE)
+    ) // TILE_K_SIZE
+
+    q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
+    q_tile_max_context = (q_tile_max_token - 1) // CONTEXT_SIZE
+    kv_end_tile_idx = tl.cdiv(
+        min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
+    )
+
+    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5) * RCP_LN2, tl.float32)
+
+    q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+    q_context_indices = q_tile_indices // CONTEXT_SIZE
+    for kv_tile_idx in tl.range(
+        kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
+    ):
+        kv_token_idx = kv_tile_idx * TILE_K_SIZE
+        if K_BLOCK_DIVISIBLE:
+            kT = tl.load(
+                tl.advance(kt_tile_ptr, (0, kv_token_idx)),
+            )
+            vT = tl.load(
+                tl.advance(vt_tile_ptr, (0, kv_token_idx)),
+            )
+        else:
+            kT = tl.load(
+                tl.advance(kt_tile_ptr, (0, kv_token_idx)),
+                boundary_check=(1,),
+            )
+            vT = tl.load(
+                tl.advance(vt_tile_ptr, (0, kv_token_idx,)),
+                boundary_check=(1,),
+            )
+
+        qk = tl.dot(q, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        p = tl.math.exp2(qk * softmax_scale - m)
+
+        kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
+        mask = (
+            kv_indices[None, :] < seq_len
+        ) & (
+            q_tile_indices[:, None] < seq_len
+        )
+        if not PERFECT_MATCHING:
+            kv_context_indices = kv_indices // CONTEXT_SIZE
+            blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
+            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
+            mask &= streaming_mask
+        p = tl.where(mask, p, 0.0)
+
+        dp = tl.dot(do, vT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        ds = (p * (dp - di[:, None])).to(kT.dtype)
+        dq = tl.dot(ds, tl.trans(kT), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+    return dq
 
 
 @triton.jit
@@ -718,8 +909,8 @@ def _streaming_attn_bwd_dkdv(
 
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        dsT = pT * (dpT - Di[None, :])
-        dk = tl.dot(dsT.to(qT.dtype), tl.trans(qT), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dsT = (pT * (dpT - Di[None, :])).to(qT.dtype)
+        dk = tl.dot(dsT, tl.trans(qT), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
 
     dk *= softmax_scale
     return dk, dv
@@ -805,9 +996,9 @@ class StreamingAttention(torch.autograd.Function):
             TIME_BUCKET=triton.next_power_of_2(T),
         )
 
-        DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
-        DK = torch.zeros_like(k, memory_format=torch.contiguous_format)
-        DV = torch.zeros_like(v, memory_format=torch.contiguous_format)
+        DQ = torch.zeros_like(q, memory_format=torch.contiguous_format, dtype=torch.float32)
+        DK = torch.zeros_like(k, memory_format=torch.contiguous_format, dtype=torch.float32)
+        DV = torch.zeros_like(v, memory_format=torch.contiguous_format, dtype=torch.float32)
 
         grid = lambda args: (
             batch,
@@ -817,14 +1008,13 @@ class StreamingAttention(torch.autograd.Function):
 
         _streaming_attn_bwd[grid](
             q, k, v, lens,
-            delta, lse, o,
+            delta, lse,
             do, DQ, DK, DV,
             *strides(q),
             *strides(k),
             *strides(v),
             *strides(delta),
             *strides(lse),
-            *strides(o),
             *strides(do),
             *strides(DQ),
             *strides(DK),
