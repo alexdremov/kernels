@@ -1,4 +1,5 @@
 import functools
+import contextlib
 import os
 import sys
 
@@ -42,7 +43,7 @@ if __name__ == "__main__":
     #     B=1, H=1, T=256, HEAD_DIM=16, context_size=257, back_contexts=0, dtype=torch.float32, lens='tricky'
     # )
     # sys.exit()
-    batches = (128,)
+    batches = (96,)
     configs = []
     params = (
         [
@@ -79,42 +80,44 @@ if __name__ == "__main__":
             for batch in batches
         ]
     )
-    for param in params:
-        line_vals = [
-            "triton",
-            "flex-compile",
-            "torch",
-        ]
-        context_size = param["context_size"]
-        back_context = param["back_context"]
-        dim = param["dim"]
-        heads = param["heads"]
-        batch = param["batch"]
+    for mode in ('bwd', 'fwd'):
+        for param in params:
+            line_vals = [
+                f"triton-{mode}",
+                f"flex-compile-{mode}",
+                f"torch-{mode}",
+            ]
+            context_size = param["context_size"]
+            back_context = param["back_context"]
+            dim = param["dim"]
+            heads = param["heads"]
+            batch = param["batch"]
 
-        x_vals = np.linspace(16, 4096 + 1, 8).astype(int).tolist()
-        x_vals = np.unique(x_vals)
-        x_vals = sorted(x_vals)
+            x_vals = np.linspace(257, 3000, 6).astype(int).tolist()
+            x_vals = np.unique(x_vals)
+            x_vals = sorted(x_vals)
 
-        configs.append(
-            triton.testing.Benchmark(
-                x_names=["time"],
-                x_vals=x_vals,
-                line_arg="provider",
-                line_vals=line_vals,
-                line_names=line_vals,
-                styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("yellow", "-")],
-                ylabel="TFLOPS",
-                plot_name=f"streaming-attention-{param['name']}-context-{context_size}-back-{back_context}-dim-{dim}-heads-{heads}-batch-{batch}",
-                args=dict(
-                    batch=batch,
-                    heads=heads,
-                    dim=dim,
-                    dtype=torch.float16,
-                    context_size=context_size,
-                    back_contexts=back_context,
-                ),
+
+            configs.append(
+                triton.testing.Benchmark(
+                    x_names=["time"],
+                    x_vals=x_vals,
+                    line_arg="provider",
+                    line_vals=line_vals,
+                    line_names=line_vals,
+                    styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("yellow", "-")],
+                    ylabel="TFLOPS",
+                    plot_name=f"streaming-attention-{mode}-{param['name']}-context-{context_size}-back-{back_context}-dim-{dim}-heads-{heads}-batch-{batch}",
+                    args=dict(
+                        batch=batch,
+                        heads=heads,
+                        dim=dim,
+                        dtype=torch.float16,
+                        context_size=context_size,
+                        back_contexts=back_context,
+                    ),
+                )
             )
-        )
 
     @triton.testing.perf_report(configs)
     def bench_streaming_attention(
@@ -126,13 +129,13 @@ if __name__ == "__main__":
 
         q = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
             mean=0.0, std=0.01
-        )
+        ).requires_grad_()
         k = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
             mean=0.0, std=0.01
-        )
+        ).requires_grad_()
         v = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
             mean=0.0, std=0.01
-        )
+        ).requires_grad_()
 
         lens = torch.randint(1, time + 1, (batch,), dtype=torch.long, device="cuda")
 
@@ -199,14 +202,34 @@ if __name__ == "__main__":
             else:
                 fn = lambda: flex_attention(q, k, v, block_mask=block_mask)
 
-        ref, res_mask, sparsity_fraction = streaming_attention_reference(
+        if 'bwd' in provider:
+            do = torch.randn((batch, heads, time, dim), dtype=torch.float32, device=device).normal_(
+                mean=0.0, std=0.01
+            )
+            def fn_back(fn):
+                res = fn()
+                res.backward(do)
+                return res, q.grad, k.grad, v.grad
+
+            fn = functools.partial(fn_back, fn=fn)
+
+        ref, res_mask, _ = streaming_attention_reference(
             q, k, v, context_size, back_contexts, lens
         )
         ref, res_mask = ref.cuda(), res_mask.cuda()
 
         print(f"Starting {provider}")
-        actual = fn()
-        actual = torch.where(res_mask.broadcast_to(actual.shape), actual, 0)
+        if 'bwd' in provider:
+            ref.backward(do)
+            dq_ref, dk_ref, dv_ref = q.grad.clone(), k.grad.clone(), v.grad.clone()
+            q.grad, k.grad, v.grad = [None] * 3
+
+            actual, dq, dk, dv = fn()
+            dq, dk, dv = dq.clone(), dk.clone(), dv.clone()
+        else:
+            actual = fn()
+
+        actual = actual * res_mask.broadcast_to(actual.shape)
 
         atol = 3e-3
         torch.testing.assert_close(
@@ -217,11 +240,37 @@ if __name__ == "__main__":
             msg=lambda x: f"error in {provider}\n{x}",
         )
 
-        with torch.inference_mode():
-            ms = triton.testing.do_bench(fn, warmup=500, rep=1000, return_mode="mean")
+        if 'bwd' in provider and 'triton' in provider:
+            for i, (d_ref, d_tri) in enumerate([(dq_ref, dq), (dk_ref, dk), (dv_ref, dv)]):
+                atol = 1e-3
+                errors = abs(d_ref - d_tri) > atol
+                b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
+                h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()
+
+                mask = res_mask.broadcast_to(d_ref.shape)
+                mean_err = (abs(d_ref[mask].to(torch.float32) - d_tri[mask].to(torch.float32)).mean() * 1000).item()
+
+                torch.testing.assert_close(
+                    d_tri,
+                    d_ref,
+                    atol=atol,
+                    rtol=0,
+                    msg=lambda x: f"error in d{'qkv'[i]}\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(d_tri - d_ref)[errors].view(-1)}\n\nlens:\n{lens}\n{mean_err = }"
+                )
+
+        with torch.inference_mode() if 'fwd' in provider else contextlib.nullcontext():
+            ms = triton.testing.do_bench(
+                fn,
+                warmup=500,
+                rep=1000,
+                return_mode="mean",
+                grad_to_none=(q, k, v)
+            )
 
         context_tok_size = context_size * (1 + back_contexts)
         total_flops = 4 * time * context_tok_size * heads * dim * batch
+        if 'bwd' in provider:
+            total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
         return (total_flops / (ms / 1000)) / 1e12
 
     bench_streaming_attention.run(save_path=".", print_data=True)

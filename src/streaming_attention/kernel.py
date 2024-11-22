@@ -28,6 +28,7 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     min_size = min(CONTEXT_SIZE, 64)
     max_size = CONTEXT_SIZE * 4
     min_pipeline, max_pipeline = 1, 3
+    min_warps, max_warps = 1, 8
 
     if HEAD_DIM == 64:
         min_pipeline = 2
@@ -35,16 +36,54 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
         max_size = 128
         min_size = 32
         max_pipeline = 2
+        max_warps = 4
     elif HEAD_DIM == 256:
         max_size = 128
         min_size = 32
         max_pipeline = 1
+        max_warps = 4
 
     configs = [i for i in configs if min_size <= i.kwargs['TILE_K_SIZE'] <= max_size]
     configs = [i for i in configs if min_size <= i.kwargs['TILE_Q_SIZE'] <= max_size]
     configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
+    configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
     print(f"Start benchmarking {len(configs) = }")
     return configs
+
+def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
+    min_size = min(CONTEXT_SIZE, 64)
+    max_size = CONTEXT_SIZE * 4
+    min_pipeline, max_pipeline = 1, 3
+    min_warps, max_warps = 1, 8
+
+    if HEAD_DIM == 32 or HEAD_DIM == 16:
+        min_pipeline = 3
+        max_size = 64
+    if HEAD_DIM == 64:
+        min_pipeline = 3
+        max_size = 128
+    elif HEAD_DIM == 128:
+        max_size = 128
+        min_size = 64
+        max_pipeline = 2
+        min_pipeline = 2
+        max_warps = 4
+    elif HEAD_DIM == 256:
+        max_size = 64
+        min_size = 32
+        max_pipeline = 2
+        min_pipeline = 2
+        max_warps = 4
+
+    configs = [i for i in configs if min_size <= i.kwargs['TILE_DQ_Q_SIZE'] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs['TILE_DQ_K_SIZE'] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs['TILE_DK_Q_SIZE'] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs['TILE_DK_K_SIZE'] <= max_size]
+    configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
+    configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
+    print(f"Start benchmarking {len(configs) = }")
+    return configs
+
 
 @triton_no_tests_autotune(
     autotune=dict(
@@ -318,7 +357,7 @@ def _streaming_attn_fwd(
                 num_warps=num_warps,
             )
             for num_warps in [2, 4, 8]
-            for tile in [16, 32, 64, 128]
+            for tile in [32, 64, 128]
         ],
         key=["HEAD_DIM", "DTYPE", "TIME_BUCKET"],
     ),
@@ -417,9 +456,9 @@ def _streaming_attn_bwd_precompute(
             for tile_kq in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
             for tile_kk in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
         ],
-        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
+        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "DTYPE", "TIME_BUCKET"],
         prune_configs_by=dict(
-            early_config_prune=fwd_configs_pruner
+            early_config_prune=bwd_configs_pruner
         )
     ),
     heuristics=dict(
@@ -466,25 +505,23 @@ def _streaming_attn_bwd(
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,  #
     lens_stride: int,
     T: int,  #
-    BATCH: int,  #
     HEAD_DIM: tl.constexpr,  #
     CONTEXT_SIZE: tl.constexpr,  #
     CONTEXTS_BACK: tl.constexpr,  #
-    INPUT_PRECISION: tl.constexpr,  #
-    TILE_DQ_Q_SIZE: tl.constexpr, TILE_DQ_K_SIZE: tl.constexpr,  #
-    TILE_DK_Q_SIZE: tl.constexpr, TILE_DK_K_SIZE: tl.constexpr,  #
-    DQ_TILES_NUM: tl.constexpr,  #
-    PRESCALE_QK: tl.constexpr,  #
     DTYPE: tl.constexpr,  #
-    RCP_LN2: tl.constexpr,  #
+    TIME_BUCKET: tl.constexpr,  #
+    INPUT_PRECISION: tl.constexpr,  #
+    DQ_TILES_NUM: tl.constexpr,  #
     PERFECT_DKV_MATCHING: tl.constexpr,  #
     PERFECT_DQ_MATCHING: tl.constexpr,  #
-    PIPELINING: tl.constexpr,  #
-    TIME_BUCKET: tl.constexpr,  #
     DQ_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     DQ_K_BLOCK_DIVISIBLE: tl.constexpr,  #
     DK_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     DK_K_BLOCK_DIVISIBLE: tl.constexpr,  #
+    RCP_LN2: tl.constexpr,  #
+    TILE_DQ_Q_SIZE: tl.constexpr, TILE_DQ_K_SIZE: tl.constexpr,  #
+    TILE_DK_Q_SIZE: tl.constexpr, TILE_DK_K_SIZE: tl.constexpr,  #
+    PIPELINING: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -495,136 +532,33 @@ def _streaming_attn_bwd(
     seq_len = min(seq_len, T)
 
     if dkv_worker:
-        kv_tile_idx = tile_id
-        kv_token_idx = kv_tile_idx * TILE_DK_K_SIZE
-
-        qbatch_head_offset = batch * stride_qb + head * stride_qh
-        qt_tile_ptr = tl.make_block_ptr(
-            base=Q + qbatch_head_offset,
-            shape=(HEAD_DIM, T),
-            strides=(stride_qk, stride_qt),
-            offsets=(0, 0),
-            block_shape=(HEAD_DIM, TILE_DK_Q_SIZE),
-            order=(1, 0),
-        )
-
-        kbatch_head_offset = batch * stride_kb + head * stride_kh
-        k_tile_ptr = tl.make_block_ptr(
-            base=K + kbatch_head_offset,
-            shape=(T, HEAD_DIM),
-            strides=(stride_kt, stride_kk),
-            offsets=(kv_token_idx, 0),
-            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
-            order=(0, 1),
-        )
-
-        vbatch_head_offset = batch * stride_vb + head * stride_vh
-        v_tile_ptr = tl.make_block_ptr(
-            base=V + vbatch_head_offset,
-            shape=(T, HEAD_DIM),
-            strides=(stride_vt, stride_vk),
-            offsets=(kv_token_idx, 0),
-            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
-            order=(0, 1),
-        )
-
-        dobatch_head_offset = batch * stride_dob + head * stride_doh
-        do_tile_ptr = tl.make_block_ptr(
-            base=DO + dobatch_head_offset,
-            shape=(T, HEAD_DIM),
-            strides=(stride_dot, stride_dok),
-            offsets=(0, 0),
-            block_shape=(TILE_DK_Q_SIZE, HEAD_DIM),
-            order=(0, 1),
-        )
-
-        lsebatch_head_offset = batch * stride_mb + head * stride_mh
-        lse_tile_ptr = tl.make_block_ptr(
-            base=LSE + lsebatch_head_offset,
-            shape=(T,),
-            strides=(stride_mt,),
-            offsets=(0,),
-            block_shape=(TILE_DK_Q_SIZE,),
-            order=(0,),
-        )
-
-        deltabatch_head_offset = batch * stride_deltab + head * stride_deltah
-        delta_tile_ptr = tl.make_block_ptr(
-            base=DELTA + deltabatch_head_offset,
-            shape=(T,),
-            strides=(stride_deltat,),
-            offsets=(0,),
-            block_shape=(TILE_DK_Q_SIZE,),
-            order=(0,),
-        )
-
-        dv = tl.zeros([TILE_DK_K_SIZE, HEAD_DIM], dtype=tl.float32)
-        dk = tl.zeros([TILE_DK_K_SIZE, HEAD_DIM], dtype=tl.float32)
-
-        if DK_K_BLOCK_DIVISIBLE:
-            k = tl.load(
-                k_tile_ptr,
-            )
-            v = tl.load(
-                v_tile_ptr,
-            )
-        else:
-            k = tl.load(
-                k_tile_ptr,
-                boundary_check=(0,),
-                padding_option='zero'
-            )
-            v = tl.load(
-                v_tile_ptr,
-                boundary_check=(0,),
-                padding_option='zero'
-            )
-
-        dk, dv = _streaming_attn_bwd_dkdv(
-            dk, dv,
-            qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
-            k, v,
+        _streaming_attn_bwd_dq_inner(
+            Q, K, V, DELTA, LSE, DO, DK, DV,
+            stride_qb, stride_qh, stride_qt, stride_qk,
+            stride_kb, stride_kh, stride_kt, stride_kk,
+            stride_vb, stride_vh, stride_vt, stride_vk,
+            stride_deltab, stride_deltah, stride_deltat,
+            stride_mb, stride_mh, stride_mt,
+            stride_dob, stride_doh, stride_dot, stride_dok,
+            stride_dkb, stride_dkh, stride_dkt, stride_dkk,
+            stride_dvb, stride_dvh, stride_dvt, stride_dvk,
+            batch=batch,
+            head=head,
+            tile_id=tile_id,
             seq_len=seq_len,
-            kv_token_idx=kv_token_idx,
+            T=T,
             HEAD_DIM=HEAD_DIM,
             CONTEXT_SIZE=CONTEXT_SIZE,
             CONTEXTS_BACK=CONTEXTS_BACK,
-            TILE_Q_SIZE=TILE_DK_Q_SIZE,
-            TILE_K_SIZE=TILE_DK_K_SIZE,
             INPUT_PRECISION=INPUT_PRECISION,
-            PERFECT_MATCHING=PERFECT_DKV_MATCHING,
-            PIPELINING=PIPELINING,
-            Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
+            PERFECT_DKV_MATCHING=PERFECT_DKV_MATCHING,
+            DK_Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
+            DK_K_BLOCK_DIVISIBLE=DK_K_BLOCK_DIVISIBLE,
             RCP_LN2=RCP_LN2,
+            TILE_DK_Q_SIZE=TILE_DK_Q_SIZE,
+            TILE_DK_K_SIZE=TILE_DK_K_SIZE,
+            PIPELINING=PIPELINING
         )
-
-        dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
-        dk_tile_ptr = tl.make_block_ptr(
-            base=DK + dkbatch_head_offset,
-            shape=(T, HEAD_DIM),
-            strides=(stride_dkt, stride_dkk),
-            offsets=(kv_token_idx, 0),
-            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
-            order=(0, 1),
-        )
-        if DK_K_BLOCK_DIVISIBLE:
-            tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty))
-        else:
-            tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty), boundary_check=(0,))
-
-        dvbatch_head_offset = batch * stride_dvb + head * stride_dvh
-        dv_tile_ptr = tl.make_block_ptr(
-            base=DV + dvbatch_head_offset,
-            shape=(T, HEAD_DIM),
-            strides=(stride_dvt, stride_dvk),
-            offsets=(kv_token_idx, 0),
-            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
-            order=(0, 1),
-        )
-        if DK_K_BLOCK_DIVISIBLE:
-            tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty))
-        else:
-            tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=(0,))
     else:
         q_tile_idx = tile_id
         q_token_idx = q_tile_idx * TILE_DQ_Q_SIZE
@@ -736,6 +670,167 @@ def _streaming_attn_bwd(
             tl.store(dq_tile_ptr, dq)
         else:
             tl.store(dq_tile_ptr, dq, boundary_check=(0,))
+
+
+@triton.jit
+def _streaming_attn_bwd_dq_inner(
+    Q, K, V, DELTA, LSE, DO, DK, DV,
+    stride_qb, stride_qh, stride_qt, stride_qk,
+    stride_kb, stride_kh, stride_kt, stride_kk,
+    stride_vb, stride_vh, stride_vt, stride_vk,
+    stride_deltab, stride_deltah, stride_deltat,
+    stride_mb, stride_mh, stride_mt,
+    stride_dob, stride_doh, stride_dot,
+    stride_dok, stride_dkb, stride_dkh,
+    stride_dkt, stride_dkk, stride_dvb,
+    stride_dvh, stride_dvt, stride_dvk,
+    batch,
+    head,
+    tile_id,
+    seq_len,
+    T: tl.constexpr,  #,,
+    HEAD_DIM: tl.constexpr,  #,
+    CONTEXT_SIZE: tl.constexpr,  #,
+    CONTEXTS_BACK: tl.constexpr,  #,
+    INPUT_PRECISION: tl.constexpr,  #,
+    PERFECT_DKV_MATCHING: tl.constexpr,  #,
+    DK_Q_BLOCK_DIVISIBLE: tl.constexpr,  #,
+    DK_K_BLOCK_DIVISIBLE: tl.constexpr,  #,
+    RCP_LN2: tl.constexpr,  #,
+    TILE_DK_Q_SIZE: tl.constexpr,  #,
+    TILE_DK_K_SIZE: tl.constexpr,  #,
+    PIPELINING: tl.constexpr,  #,
+):
+    kv_tile_idx = tile_id
+    kv_token_idx = kv_tile_idx * TILE_DK_K_SIZE
+
+    qbatch_head_offset = batch * stride_qb + head * stride_qh
+    qt_tile_ptr = tl.make_block_ptr(
+            base=Q + qbatch_head_offset,
+            shape=(HEAD_DIM, T),
+            strides=(stride_qk, stride_qt),
+            offsets=(0, 0),
+            block_shape=(HEAD_DIM, TILE_DK_Q_SIZE),
+            order=(1, 0),
+        )
+
+    kbatch_head_offset = batch * stride_kb + head * stride_kh
+    k_tile_ptr = tl.make_block_ptr(
+            base=K + kbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_kt, stride_kk),
+            offsets=(kv_token_idx, 0),
+            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+
+    vbatch_head_offset = batch * stride_vb + head * stride_vh
+    v_tile_ptr = tl.make_block_ptr(
+            base=V + vbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_vt, stride_vk),
+            offsets=(kv_token_idx, 0),
+            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+
+    dobatch_head_offset = batch * stride_dob + head * stride_doh
+    do_tile_ptr = tl.make_block_ptr(
+            base=DO + dobatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dot, stride_dok),
+            offsets=(0, 0),
+            block_shape=(TILE_DK_Q_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+
+    lsebatch_head_offset = batch * stride_mb + head * stride_mh
+    lse_tile_ptr = tl.make_block_ptr(
+            base=LSE + lsebatch_head_offset,
+            shape=(T,),
+            strides=(stride_mt,),
+            offsets=(0,),
+            block_shape=(TILE_DK_Q_SIZE,),
+            order=(0,),
+        )
+
+    deltabatch_head_offset = batch * stride_deltab + head * stride_deltah
+    delta_tile_ptr = tl.make_block_ptr(
+            base=DELTA + deltabatch_head_offset,
+            shape=(T,),
+            strides=(stride_deltat,),
+            offsets=(0,),
+            block_shape=(TILE_DK_Q_SIZE,),
+            order=(0,),
+        )
+
+    dv = tl.zeros([TILE_DK_K_SIZE, HEAD_DIM], dtype=tl.float32)
+    dk = tl.zeros([TILE_DK_K_SIZE, HEAD_DIM], dtype=tl.float32)
+
+    if DK_K_BLOCK_DIVISIBLE:
+        k = tl.load(
+                k_tile_ptr,
+            )
+        v = tl.load(
+                v_tile_ptr,
+            )
+    else:
+        k = tl.load(
+                k_tile_ptr,
+                boundary_check=(0,),
+                padding_option='zero'
+            )
+        v = tl.load(
+                v_tile_ptr,
+                boundary_check=(0,),
+                padding_option='zero'
+            )
+
+    dk, dv = _streaming_attn_bwd_dkdv(
+            dk, dv,
+            qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
+            k, v,
+            seq_len=seq_len,
+            kv_token_idx=kv_token_idx,
+            HEAD_DIM=HEAD_DIM,
+            CONTEXT_SIZE=CONTEXT_SIZE,
+            CONTEXTS_BACK=CONTEXTS_BACK,
+            TILE_Q_SIZE=TILE_DK_Q_SIZE,
+            TILE_K_SIZE=TILE_DK_K_SIZE,
+            INPUT_PRECISION=INPUT_PRECISION,
+            PERFECT_MATCHING=PERFECT_DKV_MATCHING,
+            PIPELINING=PIPELINING,
+            Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
+            RCP_LN2=RCP_LN2,
+        )
+
+    dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
+    dk_tile_ptr = tl.make_block_ptr(
+            base=DK + dkbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dkt, stride_dkk),
+            offsets=(kv_token_idx, 0),
+            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+    if DK_K_BLOCK_DIVISIBLE:
+        tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty))
+    else:
+        tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty), boundary_check=(0,))
+
+    dvbatch_head_offset = batch * stride_dvb + head * stride_dvh
+    dv_tile_ptr = tl.make_block_ptr(
+            base=DV + dvbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dvt, stride_dvk),
+            offsets=(kv_token_idx, 0),
+            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+    if DK_K_BLOCK_DIVISIBLE:
+        tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty))
+    else:
+        tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=(0,))
 
 
 @triton.jit
@@ -1020,7 +1115,6 @@ class StreamingAttention(torch.autograd.Function):
             *strides(DV),
             *strides(lens),
             T=T,
-            BATCH=batch,
             HEAD_DIM=HEAD_DIM,
             CONTEXT_SIZE=ctx.context_size,
             CONTEXTS_BACK=ctx.back_contexts,
@@ -1029,7 +1123,6 @@ class StreamingAttention(torch.autograd.Function):
                 "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
             ),
             DTYPE=q.dtype,
-            PRESCALE_QK=True,
         )
 
         return DQ, DK, DV, None, None, None
