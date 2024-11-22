@@ -1,20 +1,10 @@
-import pytest
 import os
-import functools
-
 import math
 import torch
-import numpy as np
 import torch.nn.functional as F
 
 import triton
 import triton.language as tl
-
-from torch.nn.attention.flex_attention import (
-    flex_attention,
-    create_block_mask,
-    _round_up_to_multiple as round_up_to_multiple,
-)
 
 
 def triton_no_tests_autotune(autotune, heuristics):
@@ -25,6 +15,7 @@ def triton_no_tests_autotune(autotune, heuristics):
 
     return wrapper
 
+
 MAX_TILE_SIZE = 256
 MIN_TILE_SIZE = 32
 
@@ -34,12 +25,13 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     max_size = CONTEXT_SIZE * 4
     min_pipeline, max_pipeline = 1, 3
 
-    if HEAD_DIM == 128:
+    if HEAD_DIM == 64:
+        min_pipeline = 2
+    elif HEAD_DIM == 128:
         max_size = 128
         min_size = 32
         max_pipeline = 2
-
-    if HEAD_DIM == 256:
+    elif HEAD_DIM == 256:
         max_size = 128
         min_size = 32
         max_pipeline = 1
@@ -47,7 +39,7 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     configs = [i for i in configs if min_size <= i.kwargs['TILE_K_SIZE'] <= max_size]
     configs = [i for i in configs if min_size <= i.kwargs['TILE_Q_SIZE'] <= max_size]
     configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
-    print(f"Have {len(configs) = }")
+    print(f"Start benchmarking {len(configs) = }")
     return configs
 
 @triton_no_tests_autotune(
@@ -75,10 +67,10 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     heuristics=dict(
         PIPELINING=lambda _: 1,
         TILE_Q_SIZE=lambda args: min(
-            MAX_TILE_SIZE, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
         ),
         TILE_K_SIZE=lambda args: min(
-            MAX_TILE_SIZE, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
         ),
     ),
 )
@@ -160,7 +152,8 @@ def _streaming_attn_fwd(
     m_i = tl.zeros([TILE_Q_SIZE], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([TILE_Q_SIZE], dtype=tl.float32)
     acc = tl.zeros([TILE_Q_SIZE, HEAD_DIM], dtype=tl.float32)
-    q_attended = tl.zeros([TILE_Q_SIZE], dtype=tl.int1) > 0
+    if not PERFECT_MATCHING:
+        q_attended = tl.zeros([TILE_Q_SIZE], dtype=tl.int1) > 0
 
     q_tile_min_context = q_token_idx // CONTEXT_SIZE
     kv_start_tile_idx = max(
@@ -198,10 +191,17 @@ def _streaming_attn_fwd(
             k_tile = tl.load(
                 tl.advance(k_tile_ptr, (0, kv_token_idx)),
             )
+            v_tile = tl.load(
+                tl.advance(v_tile_ptr, (kv_token_idx, 0)),
+            )
         else:
             k_tile = tl.load(
                 tl.advance(k_tile_ptr, (0, kv_token_idx)),
                 boundary_check=(1,),
+            )
+            v_tile = tl.load(
+                tl.advance(v_tile_ptr, (kv_token_idx, 0)),
+                boundary_check=(0,),
             )
 
         if PRESCALE_QK:
@@ -222,29 +222,23 @@ def _streaming_attn_fwd(
             streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
             mask &= streaming_mask
 
-        q_attended |= tl.max(mask, 1) > 0
+            q_attended |= tl.max(mask, 1) > 0
 
         if not PRESCALE_QK:
             qk = qk * softmax_scale
         qk = tl.where(mask, qk, tl.cast(-float("inf"), qk.dtype))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        m_ij_safe = tl.where(q_attended, m_ij, tl.cast(0, m_ij.dtype))
+        if not PERFECT_MATCHING:
+            m_ij_safe = tl.where(q_attended, m_ij, tl.cast(0, m_ij.dtype))
+        else:
+            m_ij_safe = m_ij
         p = tl.math.exp2(qk - m_ij_safe[:, None])
         l_ij = tl.sum(p, 1)
         alpha = tl.math.exp2(m_i - m_ij_safe)
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        if Q_BLOCK_DIVISIBLE:
-            v_tile = tl.load(
-                tl.advance(v_tile_ptr, (kv_token_idx, 0)),
-            )
-        else:
-            v_tile = tl.load(
-                tl.advance(v_tile_ptr, (kv_token_idx, 0)),
-                boundary_check=(0,),
-            )
         acc = tl.dot(
             p.to(v_tile.dtype),
             v_tile,
@@ -254,7 +248,8 @@ def _streaming_attn_fwd(
         )
         m_i = m_ij
 
-    l_i = tl.where(q_attended, l_i, 1)
+    if not PERFECT_MATCHING:
+        l_i = tl.where(q_attended, l_i, 1)
     acc = acc / l_i[:, None]
 
     obatch_head_offset = batch * stride_ob + head * stride_oh
@@ -306,6 +301,15 @@ def _streaming_attn_fwd(
 
 @triton.heuristics(
     dict(
+        TILE_DQ_Q_SIZE=lambda _: 16,
+        TILE_DQ_K_SIZE=lambda _: 16,
+        TILE_DK_Q_SIZE=lambda _: 16,
+        TILE_DK_K_SIZE=lambda _: 16,
+
+    )
+)
+@triton.heuristics(
+    dict(
         RCP_LN2=lambda _: math.log2(math.e),
         DQ_TILES_NUM=lambda args: triton.cdiv(args['T'], args["TILE_DQ_Q_SIZE"]),
     )
@@ -344,9 +348,22 @@ def _streaming_attn_bwd(
     dkv_worker = tl.program_id(2) >= DQ_TILES_NUM
     tile_id = tl.program_id(2) - (DQ_TILES_NUM * dkv_worker)
 
+    seq_len = tl.load(L + batch * lens_stride)
+    seq_len = min(seq_len, T)
+
     if dkv_worker:
         kv_tile_idx = tile_id
         kv_token_idx = kv_tile_idx * TILE_DK_K_SIZE
+
+        qbatch_head_offset = batch * stride_qb + head * stride_qh
+        qt_tile_ptr = tl.make_block_ptr(
+            base=Q + qbatch_head_offset,
+            shape=(HEAD_DIM, T),
+            strides=(stride_qk, stride_qt),
+            offsets=(0, 0),
+            block_shape=(HEAD_DIM, TILE_DK_Q_SIZE),
+            order=(1, 0),
+        )
 
         kbatch_head_offset = batch * stride_kb + head * stride_kh
         k_tile_ptr = tl.make_block_ptr(
@@ -355,7 +372,7 @@ def _streaming_attn_bwd(
             strides=(stride_kt, stride_kk),
             offsets=(kv_token_idx, 0),
             block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
-            order=(1, 0),
+            order=(0, 1),
         )
 
         vbatch_head_offset = batch * stride_vb + head * stride_vh
@@ -365,7 +382,37 @@ def _streaming_attn_bwd(
             strides=(stride_vt, stride_vk),
             offsets=(kv_token_idx, 0),
             block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
-            order=(1, 0),
+            order=(0, 1),
+        )
+
+        dobatch_head_offset = batch * stride_dob + head * stride_doh
+        do_tile_ptr = tl.make_block_ptr(
+            base=DO + dobatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dot, stride_dok),
+            offsets=(0, 0),
+            block_shape=(TILE_DK_Q_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+
+        lsebatch_head_offset = batch * stride_mb + head * stride_mh
+        lse_tile_ptr = tl.make_block_ptr(
+            base=LSE + lsebatch_head_offset,
+            shape=(T,),
+            strides=(stride_mt,),
+            offsets=(0,),
+            block_shape=(TILE_DK_Q_SIZE,),
+            order=(0,),
+        )
+
+        deltabatch_head_offset = batch * stride_deltab + head * stride_deltah
+        delta_tile_ptr = tl.make_block_ptr(
+            base=DELTA + deltabatch_head_offset,
+            shape=(T,),
+            strides=(stride_deltat,),
+            offsets=(0,),
+            block_shape=(TILE_DK_Q_SIZE,),
+            order=(0,),
         )
 
         dv = tl.zeros([TILE_DK_K_SIZE, HEAD_DIM], dtype=tl.float32)
@@ -381,21 +428,117 @@ def _streaming_attn_bwd(
             boundary_check=(0,),
             padding_option='zero'
         )
-        # lg2(e) temperatire adjustment
-        softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5) * RCP_LN2, v.dtype)
 
-        if PRESCALE_QK:
-            k = k * softmax_scale
-
-        qbatch_head_offset = batch * stride_qb + head * stride_qh
-        q_tile_ptr = tl.make_block_ptr(
-            base=Q + qbatch_head_offset,
-            shape=(T, HEAD_DIM),
-            strides=(stride_qt, stride_qk),
-            offsets=(0, 0),
-            block_shape=(TILE_DK_Q_SIZE, HEAD_DIM),
-            order=(1, 0),
+        dk, dv = _streaming_attn_bwd_dkdv(
+            dk, dv,
+            qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
+            k, v,
+            seq_len=seq_len,
+            kv_token_idx=kv_token_idx,
+            HEAD_DIM=HEAD_DIM,
+            CONTEXT_SIZE=CONTEXT_SIZE,
+            CONTEXTS_BACK=CONTEXTS_BACK,
+            TILE_Q_SIZE=TILE_DK_Q_SIZE,
+            TILE_K_SIZE=TILE_DK_K_SIZE,
+            INPUT_PRECISION=INPUT_PRECISION,
+            RCP_LN2=RCP_LN2,
         )
+
+        dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
+        dk_tile_ptr = tl.make_block_ptr(
+            base=DK + dkbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dkt, stride_dkk),
+            offsets=(kv_token_idx, 0),
+            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+        tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty), boundary_check=0)
+
+        dvbatch_head_offset = batch * stride_dvb + head * stride_dvh
+        dv_tile_ptr = tl.make_block_ptr(
+            base=DV + dvbatch_head_offset,
+            shape=(T, HEAD_DIM),
+            strides=(stride_dvt, stride_dvk),
+            offsets=(kv_token_idx, 0),
+            block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
+            order=(0, 1),
+        )
+        tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=0)
+
+
+@triton.jit
+def _streaming_attn_bwd_dkdv(
+    dk, dv,
+    qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
+    k, v,
+    seq_len,
+    kv_token_idx,
+    HEAD_DIM: tl.constexpr,
+    CONTEXT_SIZE: tl.constexpr,
+    CONTEXTS_BACK: tl.constexpr,
+    TILE_Q_SIZE: tl.constexpr,
+    TILE_K_SIZE: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+    RCP_LN2,
+):
+    kv_tile_min_context = kv_token_idx // CONTEXT_SIZE
+    q_start_tile_idx = (kv_tile_min_context * CONTEXT_SIZE) // TILE_Q_SIZE
+
+    kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len) - 1
+    kv_tile_max_context = kv_tile_max_token // CONTEXT_SIZE
+    q_end_tile_idx = tl.cdiv(
+        min((kv_tile_max_context + CONTEXTS_BACK + 1) * CONTEXT_SIZE, seq_len),
+        TILE_Q_SIZE,
+    )
+
+    kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
+    kv_context_indices = kv_indices // CONTEXT_SIZE
+
+    for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx):
+        q_token_idx = q_tile_idx * TILE_Q_SIZE
+        qT = tl.load(
+            tl.advance(qt_tile_ptr, (0, q_token_idx)),
+            boundary_check=(1,),
+        )
+        m = tl.load(
+            tl.advance(lse_tile_ptr, (q_token_idx,)),
+            boundary_check=(0,),
+        )
+        qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        pT = tl.math.exp2(qkT - m[None, :])
+
+
+        q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+        q_context_indices = q_tile_indices // CONTEXT_SIZE
+        mask = (
+            kv_indices[None, :] < seq_len
+        ) & (
+            q_tile_indices[:, None] < seq_len
+        )
+        blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
+        streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
+        mask &= streaming_mask
+        pT = tl.where(mask, pT, 0.0)
+
+        do = tl.load(
+            tl.advance(do_tile_ptr, (q_token_idx, 0)),
+            boundary_check=(0,),
+        )
+
+        dv += tl.dot(pT.to(do.dtype), do)
+        # D (= delta) is pre-divided by ds_scale.
+        Di = tl.load(
+            tl.advance(delta_tile_ptr, (q_token_idx,)),
+        )
+        # Compute dP and dS.
+        dpT = tl.dot(v, tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dsT = pT * (dpT - Di[None, :])
+        dk += tl.dot(dsT.to(qT.dtype), tl.trans(qT))
+
+    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5), dk.dtype)
+    dk *= softmax_scale
+    return dk, dv
 
 
 class StreamingAttention(torch.autograd.Function):
@@ -461,7 +604,9 @@ class StreamingAttention(torch.autograd.Function):
         q, k, v, o, lse, lens = ctx.saved_tensors
         batch, heads, T, HEAD_DIM = q.shape
 
-        delta = (o * do).sum(-1).contiguous()
+        print(torch.isnan(lse).sum())
+
+        delta = (o * do.float()).sum(-1).contiguous()
         DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
         DK = torch.empty_like(k, memory_format=torch.contiguous_format)
         DV = torch.empty_like(v, memory_format=torch.contiguous_format)
@@ -480,7 +625,7 @@ class StreamingAttention(torch.autograd.Function):
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             delta.stride(0), delta.stride(1), delta.stride(2),
-            lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3),
+            lse.stride(0), lse.stride(1), lse.stride(2),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
             DQ.stride(0), DQ.stride(1), DQ.stride(2), DQ.stride(3),
@@ -502,4 +647,57 @@ class StreamingAttention(torch.autograd.Function):
         return DQ, DK, DV, None, None, None
 
 
+def streaming_attention_reference(q, k, v, context_size, back_contexts, lens):
+    block_size = context_size
+    left_context_blocks_count = back_contexts + 1
+    T = q.shape[-2]
+
+    block_idxes = torch.div(torch.arange(T), block_size, rounding_mode="floor")
+    block_idxes_diff = block_idxes.unsqueeze(1) - block_idxes.unsqueeze(0)
+    attn_mask = (block_idxes_diff >= 0) & (block_idxes_diff < left_context_blocks_count)
+    attn_mask = attn_mask.cuda()
+
+    if lens is not None:
+        key_padding_mask = (
+            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+        ).unsqueeze(-1)
+        key_padding_mask_ref = key_padding_mask
+        key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.unsqueeze(1)
+        res_mask = key_padding_mask_ref.unsqueeze(1)
+    else:
+        res_mask = torch.tensor([True], device="cuda")
+
+    sparsity_fraction = attn_mask.sum().item() / attn_mask.numel()
+    return (
+        F.scaled_dot_product_attention(
+            query=q, key=k, value=v, attn_mask=attn_mask
+        ) * res_mask,
+        res_mask,
+        sparsity_fraction,
+    )
+
+
 streaming_attention = StreamingAttention.apply
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(
+        0,
+        f"{os.path.dirname(os.path.realpath(__file__))}/../../"
+    )
+    sys.path.insert(
+        0,
+        f"{os.path.dirname(os.path.realpath(__file__))}/../"
+    )
+
+    B, H, T, D = 7, 1, 1, 128
+    context, back = 10, 9
+
+    from tests.test_streaming_attention import test_op
+
+    test_op(
+        B, H, T, D, context, back, dtype=torch.float16, lens='none'
+    )

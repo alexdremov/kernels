@@ -1,1 +1,1 @@
-from .kernel import streaming_attention
+from .kernel import streaming_attention, streaming_attention_reference
