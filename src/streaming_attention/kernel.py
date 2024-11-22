@@ -313,6 +313,94 @@ def _streaming_attn_fwd(
         configs=[
             triton.Config(
                 dict(
+                    TILE_SIZE=tile,
+                ),
+                num_warps=num_warps,
+            )
+            for num_warps in [2, 4, 8]
+            for tile in [16, 32, 64, 128]
+        ],
+        key=["HEAD_DIM", "DTYPE", "TIME_BUCKET"],
+    ),
+    heuristics=dict(
+        TILE_SIZE=lambda _: 64,
+    ),
+)
+@triton.heuristics(
+    dict(
+        BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_SIZE'] == 0,
+    )
+)
+@triton.jit
+def _streaming_attn_bwd_precompute(
+    O, DO, RES,
+    stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int,  #
+    stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,  #
+    stride_rb: int, stride_rh: int, stride_rt: int,
+    T: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    DTYPE:  tl.constexpr,  #
+    TIME_BUCKET: tl.constexpr,  #
+    TILE_SIZE: tl.constexpr,
+    BLOCK_DIVISIBLE: tl.constexpr,  #
+):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+    tile = tl.program_id(2)
+
+    token_idx = tile * TILE_SIZE
+
+    obatch_head_offset = batch * stride_ob + head * stride_oh
+    o_tile_ptr = tl.make_block_ptr(
+        base=O + obatch_head_offset,
+        shape=(T, HEAD_DIM),
+        strides=(stride_ot, stride_ok),
+        offsets=(token_idx, 0),
+        block_shape=(TILE_SIZE, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    dobatch_head_offset = batch * stride_dob + head * stride_doh
+    do_tile_ptr = tl.make_block_ptr(
+        base=DO + dobatch_head_offset,
+        shape=(T, HEAD_DIM),
+        strides=(stride_dot, stride_dok),
+        offsets=(token_idx, 0),
+        block_shape=(TILE_SIZE, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    if BLOCK_DIVISIBLE:
+        o_tile = tl.load(o_tile_ptr, )
+        do_tile = tl.load(do_tile_ptr, )
+    else:
+        o_tile = tl.load(o_tile_ptr, boundary_check=(0,))
+        do_tile = tl.load(do_tile_ptr, boundary_check=(0,))
+
+    res = tl.sum(o_tile.to(tl.float32) * do_tile.to(tl.float32), 1)
+
+    rbatch_head_offset = batch * stride_rb + head * stride_rh
+    res_ptr = tl.make_block_ptr(
+        base=RES + rbatch_head_offset,
+        shape=(T,),
+        strides=(stride_rt,),
+        offsets=(token_idx,),
+        block_shape=(TILE_SIZE,),
+        order=(0,),
+    )
+
+    if BLOCK_DIVISIBLE:
+        tl.store(res_ptr, res)
+    else:
+        tl.store(res_ptr, res, boundary_check=(0,))
+
+
+
+@triton_no_tests_autotune(
+    autotune=dict(
+        configs=[
+            triton.Config(
+                dict(
                     PIPELINING=pipe,
                     TILE_DQ_Q_SIZE=tile_qq,
                     TILE_DQ_K_SIZE=tile_qk,
@@ -355,6 +443,8 @@ def _streaming_attn_fwd(
         RCP_LN2=lambda _: math.log2(math.e),
         DQ_TILES_NUM=lambda args: triton.cdiv(args['T'], args["TILE_DQ_Q_SIZE"]),
         PERFECT_DKV_MATCHING=lambda args : args['TILE_DK_Q_SIZE'] == args['TILE_DK_K_SIZE'] and args['TILE_DK_K_SIZE'] == args['CONTEXT_SIZE'],
+        DK_Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DK_Q_SIZE'] == 0,
+        DK_K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DK_K_SIZE'] == 0,
     )
 )
 @triton.jit
@@ -388,6 +478,8 @@ def _streaming_attn_bwd(
     PERFECT_DKV_MATCHING: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     TIME_BUCKET: tl.constexpr,  #
+    DK_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
+    DK_K_BLOCK_DIVISIBLE: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -464,16 +556,24 @@ def _streaming_attn_bwd(
         dv = tl.zeros([TILE_DK_K_SIZE, HEAD_DIM], dtype=tl.float32)
         dk = tl.zeros([TILE_DK_K_SIZE, HEAD_DIM], dtype=tl.float32)
 
-        k = tl.load(
-            k_tile_ptr,
-            boundary_check=(0,),
-            padding_option='zero'
-        )
-        v = tl.load(
-            v_tile_ptr,
-            boundary_check=(0,),
-            padding_option='zero'
-        )
+        if DK_K_BLOCK_DIVISIBLE:
+            k = tl.load(
+                k_tile_ptr,
+            )
+            v = tl.load(
+                v_tile_ptr,
+            )
+        else:
+            k = tl.load(
+                k_tile_ptr,
+                boundary_check=(0,),
+                padding_option='zero'
+            )
+            v = tl.load(
+                v_tile_ptr,
+                boundary_check=(0,),
+                padding_option='zero'
+            )
 
         dk, dv = _streaming_attn_bwd_dkdv(
             dk, dv,
@@ -490,6 +590,7 @@ def _streaming_attn_bwd(
             RCP_LN2=RCP_LN2,
             PERFECT_MATCHING=PERFECT_DKV_MATCHING,
             PIPELINING=PIPELINING,
+            Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
         )
 
         dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
@@ -501,7 +602,10 @@ def _streaming_attn_bwd(
             block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
             order=(0, 1),
         )
-        tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty), boundary_check=(0,))
+        if DK_K_BLOCK_DIVISIBLE:
+            tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty))
+        else:
+            tl.store(dk_tile_ptr, dk.to(dk_tile_ptr.type.element_ty), boundary_check=(0,))
 
         dvbatch_head_offset = batch * stride_dvb + head * stride_dvh
         dv_tile_ptr = tl.make_block_ptr(
@@ -512,7 +616,10 @@ def _streaming_attn_bwd(
             block_shape=(TILE_DK_K_SIZE, HEAD_DIM),
             order=(0, 1),
         )
-        tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=(0,))
+        if DK_K_BLOCK_DIVISIBLE:
+            tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty))
+        else:
+            tl.store(dv_tile_ptr, dv.to(dv_tile_ptr.type.element_ty), boundary_check=(0,))
 
 
 @triton.jit
@@ -531,6 +638,7 @@ def _streaming_attn_bwd_dkdv(
     RCP_LN2: tl.constexpr,
     PERFECT_MATCHING: tl.constexpr,
     PIPELINING: tl.constexpr,
+    Q_BLOCK_DIVISIBLE: tl.constexpr,
 ):
     kv_tile_min_context = kv_token_idx // CONTEXT_SIZE
     q_start_tile_idx = (kv_tile_min_context * CONTEXT_SIZE) // TILE_Q_SIZE
@@ -549,16 +657,24 @@ def _streaming_attn_bwd_dkdv(
 
     for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
-        qT = tl.load(
-            tl.advance(qt_tile_ptr, (0, q_token_idx)),
-            boundary_check=(1,),
-            padding_option='zero',
-        )
-        m = tl.load(
-            tl.advance(lse_tile_ptr, (q_token_idx,)),
-            boundary_check=(0,),
-            padding_option='zero',
-        )
+        if Q_BLOCK_DIVISIBLE:
+            qT = tl.load(
+                tl.advance(qt_tile_ptr, (0, q_token_idx)),
+            )
+            m = tl.load(
+                tl.advance(lse_tile_ptr, (q_token_idx,)),
+            )
+        else:
+            qT = tl.load(
+                tl.advance(qt_tile_ptr, (0, q_token_idx)),
+                boundary_check=(1,),
+                padding_option='zero',
+            )
+            m = tl.load(
+                tl.advance(lse_tile_ptr, (q_token_idx,)),
+                boundary_check=(0,),
+                padding_option='zero',
+            )
         tl.static_assert(m.dtype == tl.float32)
 
         qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -577,19 +693,29 @@ def _streaming_attn_bwd_dkdv(
             mask &= streaming_mask
         pT = tl.where(mask, pT, 0.0)
 
-        do = tl.load(
-            tl.advance(do_tile_ptr, (q_token_idx, 0)),
-            boundary_check=(0,),
-            padding_option='zero',
-        )
+        if Q_BLOCK_DIVISIBLE:
+            do = tl.load(
+                tl.advance(do_tile_ptr, (q_token_idx, 0)),
+            )
+        else:
+            do = tl.load(
+                tl.advance(do_tile_ptr, (q_token_idx, 0)),
+                boundary_check=(0,),
+                padding_option='zero',
+            )
 
         dv = tl.dot(pT.to(do.dtype), do, dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(
-            tl.advance(delta_tile_ptr, (q_token_idx,)),
-            boundary_check=(0,),
-            padding_option='zero',
-        )
+        if Q_BLOCK_DIVISIBLE:
+            Di = tl.load(
+                tl.advance(delta_tile_ptr, (q_token_idx,)),
+            )
+        else:
+            Di = tl.load(
+                tl.advance(delta_tile_ptr, (q_token_idx,)),
+                boundary_check=(0,),
+                padding_option='zero',
+            )
         tl.static_assert(Di.dtype == tl.float32)
 
         # Compute dP and dS.
@@ -664,7 +790,22 @@ class StreamingAttention(torch.autograd.Function):
         q, k, v, o, lse, lens = ctx.saved_tensors
         batch, heads, T, HEAD_DIM = q.shape
 
-        delta = (o * do.float()).sum(-1)
+        delta = torch.empty(o.shape[:-1], dtype=torch.float32, device=o.device)
+        grid = lambda args: (
+            batch,
+            heads,
+            triton.cdiv(T, args["TILE_SIZE"]),
+        )
+        _streaming_attn_bwd_precompute[grid](
+            o, do, delta,
+            *strides(o),
+            *strides(do),
+            *strides(delta),
+            T=T,
+            HEAD_DIM=HEAD_DIM,
+            DTYPE=q.dtype,
+            TIME_BUCKET=triton.next_power_of_2(T),
+        )
 
         DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
         DK = torch.zeros_like(k, memory_format=torch.contiguous_format)
