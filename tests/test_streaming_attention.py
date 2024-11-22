@@ -1,9 +1,11 @@
-import torch
-import pytest
 import os
-import numpy as np
 
-from streaming_attention import streaming_attention, streaming_attention_reference
+import numpy as np
+import pytest
+import torch
+
+from streaming_attention import (streaming_attention,
+                                 streaming_attention_reference)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16], ids=lambda x: f"{x}")
@@ -105,7 +107,7 @@ def test_op(
         msg=lambda x: f"{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(tri_out - ref)[errors].view(-1)}\n\nlens:\n{lens}\n{ref}\n{tri_out}",
     )
     for i, (d_ref, d_tri) in enumerate([(ref_dk, tri_dk), (ref_dv, tri_dv),]):  # (ref_dv, tri_dv), (ref_dq, tri_dq)
-        atol = 5e-3
+        atol = 3e-3
         errors = abs(d_ref - d_tri) > atol
         b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
         h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()

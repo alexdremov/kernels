@@ -1,12 +1,11 @@
-import torch
-import torch.nn.functional as F
-
-import triton
-import os
-import numpy as np
 import functools
+import os
 import sys
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+import triton
 
 sys.path.insert(
     0,
@@ -14,14 +13,12 @@ sys.path.insert(
 )
 
 
-from streaming_attention import streaming_attention, streaming_attention_reference
+from torch.nn.attention.flex_attention import \
+    _round_up_to_multiple as round_up_to_multiple
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-
-from torch.nn.attention.flex_attention import (
-    flex_attention,
-    _round_up_to_multiple as round_up_to_multiple,
-    create_block_mask,
-)
+from streaming_attention import (streaming_attention,
+                                 streaming_attention_reference)
 
 
 def _flex_attention_chunked_mask_generator(

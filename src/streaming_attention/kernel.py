@@ -1,8 +1,8 @@
-import os
 import math
+import os
+
 import torch
 import torch.nn.functional as F
-
 import triton
 import triton.language as tl
 
@@ -587,7 +587,6 @@ def _streaming_attn_bwd(
             TILE_Q_SIZE=TILE_DK_Q_SIZE,
             TILE_K_SIZE=TILE_DK_K_SIZE,
             INPUT_PRECISION=INPUT_PRECISION,
-            RCP_LN2=RCP_LN2,
             PERFECT_MATCHING=PERFECT_DKV_MATCHING,
             PIPELINING=PIPELINING,
             Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
@@ -635,7 +634,6 @@ def _streaming_attn_bwd_dkdv(
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    RCP_LN2: tl.constexpr,
     PERFECT_MATCHING: tl.constexpr,
     PIPELINING: tl.constexpr,
     Q_BLOCK_DIVISIBLE: tl.constexpr,
