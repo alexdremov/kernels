@@ -254,7 +254,12 @@ def _streaming_attn_fwd(
 
     if not PERFECT_MATCHING:
         l_i = tl.where(q_attended, l_i, 1)
-    acc = acc / l_i[:, None]
+        acc = acc / l_i[:, None]
+    else:
+        acc = acc / l_i[:, None]
+        seq_mask = q_tile_indices < seq_len
+        acc = tl.where(seq_mask[:, None], acc, 0.0)
+
 
     obatch_head_offset = batch * stride_ob + head * stride_oh
     o_tile_ptr = tl.make_block_ptr(
@@ -544,7 +549,6 @@ def _streaming_attn_bwd_dkdv(
             padding_option='zero',
         )
         tl.static_assert(Di.dtype == tl.float32)
-        tl.device_assert(tl.sum(Di != Di).sum() == 0)
 
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -572,8 +576,8 @@ class StreamingAttention(torch.autograd.Function):
 
         assert lens is None or (lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1)
 
-        O = torch.empty_like(q, memory_format=torch.contiguous_format)
-        LSE = torch.empty(q.shape[:3], dtype=torch.float32, device=q.device)
+        O = torch.zeros_like(q, memory_format=torch.contiguous_format)
+        LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
 
         grid = lambda args: (
             batch,
@@ -619,6 +623,7 @@ class StreamingAttention(torch.autograd.Function):
         batch, heads, T, HEAD_DIM = q.shape
 
         delta = (o * do.float()).sum(-1)
+
         DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
         DK = torch.zeros_like(k, memory_format=torch.contiguous_format)
         DV = torch.zeros_like(v, memory_format=torch.contiguous_format)

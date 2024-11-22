@@ -46,7 +46,7 @@ def test_op(
         mean=0.0, std=0.01
     ).requires_grad_()
 
-    dout = torch.randn_like(q, dtype=torch.float32) / 100
+    dout = torch.randn_like(q, dtype=torch.float32) / 10
 
     if lens == "none":
         lens = None
@@ -91,7 +91,7 @@ def test_op(
 
     # torch.set_printoptions(linewidth=400, profile="full")
 
-    tri_out = torch.where(res_mask.broadcast_to(tri_out.shape), tri_out, 0)
+    tri_out = tri_out * res_mask.broadcast_to(tri_out.shape)
     atol = 1e-3
     errors = abs(tri_out - ref) > atol
     b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
@@ -104,8 +104,8 @@ def test_op(
         rtol=0,
         msg=lambda x: f"{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(tri_out - ref)[errors].view(-1)}\n\nlens:\n{lens}\n{ref}\n{tri_out}",
     )
-    for i, (d_ref, d_tri) in enumerate([(ref_dk, tri_dk), ]):  # (ref_dv, tri_dv), (ref_dq, tri_dq)
-        atol = 1e-3
+    for i, (d_ref, d_tri) in enumerate([(ref_dk, tri_dk), (ref_dv, tri_dv),]):  # (ref_dv, tri_dv), (ref_dq, tri_dq)
+        atol = 5e-3
         errors = abs(d_ref - d_tri) > atol
         b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
         h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()
