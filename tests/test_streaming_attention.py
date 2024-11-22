@@ -15,7 +15,7 @@ from streaming_attention import (streaming_attention,
 @pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
 @pytest.mark.parametrize("B", [1, 7, 67], ids=lambda x: f"batch-{x}")
 @pytest.mark.parametrize("H", [1, 6], ids=lambda x: f"heads-{x}")
-@pytest.mark.parametrize("T", [1, 10, 16, 313], ids=lambda x: f"time-{x}")
+@pytest.mark.parametrize("T", [1, 10, 16, 800], ids=lambda x: f"time-{x}")
 @pytest.mark.parametrize(
     "context_size", [1, 10, 16, 32, 100, 256], ids=lambda x: f"context-{x}"
 )
@@ -48,7 +48,9 @@ def test_op(
         mean=0.0, std=0.01
     ).requires_grad_()
 
-    dout = torch.randn_like(q, dtype=torch.float32) / 10
+    dout = torch.randn_like(q, dtype=torch.float32).normal_(
+        mean=0.0, std=0.01
+    )
 
     if lens == "none":
         lens = None
@@ -94,7 +96,7 @@ def test_op(
     # torch.set_printoptions(linewidth=400, profile="full")
 
     tri_out = tri_out * res_mask.broadcast_to(tri_out.shape)
-    atol = 2e-2
+    atol = 1e-2
     errors = abs(tri_out - ref) > atol
     b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
     h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()
@@ -107,7 +109,7 @@ def test_op(
         msg=lambda x: f"{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(tri_out - ref)[errors].view(-1)}\n\nlens:\n{lens}\n{ref}\n{tri_out}",
     )
     for i, (d_ref, d_tri) in enumerate([(ref_dk, tri_dk), (ref_dv, tri_dv), (ref_dq, tri_dq)]):
-        atol = 1e-2
+        atol = 2e-3
         errors = abs(d_ref - d_tri) > atol
         b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
         h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()

@@ -595,6 +595,7 @@ def _streaming_attn_bwd(
             PERFECT_MATCHING=PERFECT_DKV_MATCHING,
             PIPELINING=PIPELINING,
             Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
+            RCP_LN2=RCP_LN2,
         )
 
         dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
@@ -765,7 +766,7 @@ def _streaming_attn_bwd_dq(
         min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
     )
 
-    softmax_scale: tl.constexpr = tl.cast(RCP_LN2, q.dtype)
+    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5), q.dtype)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
     q_context_indices = q_tile_indices // CONTEXT_SIZE
@@ -790,8 +791,8 @@ def _streaming_attn_bwd_dq(
                 boundary_check=(1,),
             )
 
-        qk = tl.dot(q, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        p = tl.math.exp2(qk * softmax_scale - m)
+        qk = tl.dot(q * softmax_scale, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        p = tl.math.exp2(qk / RCP_LN2 - m)
 
         kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
         mask = (
@@ -807,8 +808,8 @@ def _streaming_attn_bwd_dq(
         p = tl.where(mask, p, 0.0)
 
         dp = tl.dot(do, vT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        ds = (p * (dp - di[:, None])).to(kT.dtype)
-        dq = tl.dot(ds, tl.trans(kT), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        ds = p * (dp - di[:, None]) * softmax_scale
+        dq = tl.dot(ds.to(kT.dtype), tl.trans(kT), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
     return dq
 
 
@@ -828,6 +829,7 @@ def _streaming_attn_bwd_dkdv(
     PERFECT_MATCHING: tl.constexpr,
     PIPELINING: tl.constexpr,
     Q_BLOCK_DIVISIBLE: tl.constexpr,
+    RCP_LN2: tl.constexpr,
 ):
     kv_tile_min_context = kv_token_idx // CONTEXT_SIZE
     q_start_tile_idx = (kv_tile_min_context * CONTEXT_SIZE) // TILE_Q_SIZE
@@ -842,7 +844,7 @@ def _streaming_attn_bwd_dkdv(
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
     kv_context_indices = kv_indices // CONTEXT_SIZE
 
-    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5), dk.dtype)
+    softmax_scale: tl.constexpr = tl.cast((HEAD_DIM**-0.5) / RCP_LN2, k.dtype)
 
     for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
@@ -866,7 +868,7 @@ def _streaming_attn_bwd_dkdv(
             )
         tl.static_assert(m.dtype == tl.float32)
 
-        qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        qkT = tl.dot(k * softmax_scale, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
@@ -894,7 +896,6 @@ def _streaming_attn_bwd_dkdv(
             )
 
         dv = tl.dot(pT.to(do.dtype), do, dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        # D (= delta) is pre-divided by ds_scale.
         if Q_BLOCK_DIVISIBLE:
             Di = tl.load(
                 tl.advance(delta_tile_ptr, (q_token_idx,)),
@@ -909,10 +910,8 @@ def _streaming_attn_bwd_dkdv(
 
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        dsT = (pT * (dpT - Di[None, :])).to(qT.dtype)
-        dk = tl.dot(dsT, tl.trans(qT), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-
-    dk *= softmax_scale
+        dsT = pT * (dpT - Di[None, :])
+        dk = tl.dot(dsT.to(qT.dtype), tl.trans(qT), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
     return dk, dv
 
 
