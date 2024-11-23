@@ -14,11 +14,82 @@ MIN_TILE_SIZE = 32
 logger = logging.getLogger(__name__)
 
 
+# BLOCK_Q, BLOCK_K, num_warps, num_stages
+_h100_default_config = {
+    (torch.float32, 64): (128, 32, 4, 3),
+    (torch.float32, 128): (32, 64, 4, 3),
+    (torch.float32, 256): (32, 32, 4, 3),
+    (torch.bfloat16, 64): (128, 128, 4, 3),
+    (torch.bfloat16, 128): (128, 64, 8, 3),
+    (torch.bfloat16, 256): (64, 32, 4, 3),
+    (torch.float16, 64): (128, 128, 4, 3),
+    (torch.float16, 128): (128, 128, 8, 3),
+    (torch.float16, 256): (64, 32, 4, 3),
+}
+
+_a100_default_config = {
+    (torch.float32, 64): (128, 32, 4, 3),
+    (torch.float32, 128): (128, 32, 4, 3),
+    (torch.float32, 256): (64, 16, 4, 3),
+    (torch.bfloat16, 64): (128, 64, 4, 3),
+    (torch.bfloat16, 128): (128, 64, 8, 3),
+    (torch.bfloat16, 256): (32, 64, 4, 3),
+    (torch.float16, 64): (128, 64, 4, 3),
+    (torch.float16, 128): (128, 64, 8, 3),
+    (torch.float16, 256): (32, 64, 4, 3),
+}
+
+
+def _get_default_config_fwd(head_dim, dtype) -> tuple[int, int, int, int]:
+    default_config = None
+
+    if head_dim <= 256 and torch.cuda.get_device_capability() >= (9, 0):  # H100
+        if dtype == torch.float32:
+            default_config = (64, 64, 4, 3)
+        else:
+            default_config = (128, 64, 4, 3)
+        default_config = _h100_default_config.get((dtype, head_dim), default_config)
+    elif head_dim <= 256 and torch.cuda.get_device_capability() >= (8, 0):  # A100
+        if dtype == torch.float32:
+            default_config = (64, 64, 4, 3)
+        else:
+            default_config = (128, 64, 4, 3)
+        default_config = _a100_default_config.get((dtype, head_dim), default_config)
+    else:  # modest hardware or extremely large head_dim
+        if dtype == torch.float32:
+            default_config = (32, 16, 4, 3)
+        else:
+            default_config = (64, 32, 4, 3)
+
+    return default_config
+
+
+def _get_default_config_bwd(head_dim, dtype) -> tuple[int, int, int, int]:
+    if dtype == torch.float32:
+        return (16, 16, 4, 1)
+    elif head_dim <= 256 and torch.cuda.get_device_capability() >= (9, 0):  # H100
+        if head_dim == 64:
+            return (64, 64, 4, 3)
+        elif head_dim == 128:
+            return (64, 128, 8, 3)
+        else:
+            return (64, 64, 4, 2)
+    elif torch.cuda.get_device_capability() >= (8, 0):  # A100
+        if head_dim == 64:
+            return (32, 128, 4, 3)
+        elif head_dim == 128:
+            return (64, 128, 8, 3)
+        else:
+            return (64, 64, 4, 2)
+    else:  # modest hardware or extremely large head_dim
+        return (16, 16, 4, 1)
+
+
 def strides(t):
     return [t.stride(i) for i in range(t.ndim)]
 
 
-def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
+def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
     min_size = min(CONTEXT_SIZE, 64)
     max_size = CONTEXT_SIZE * 4
     min_pipeline, max_pipeline = 1, 3
@@ -41,11 +112,26 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     configs = [i for i in configs if min_size <= i.kwargs['TILE_Q_SIZE'] <= max_size]
     configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
     configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
+
+    default_config = _get_default_config_fwd(HEAD_DIM, DTYPE)
+    if default_config is not None:
+        configs += [
+            triton.Config(
+            dict(
+                    PIPELINING=default_config[3],
+                    TILE_Q_SIZE=default_config[0],
+                    TILE_K_SIZE=default_config[1],
+                ),
+                num_warps=default_config[2],
+                num_stages=default_config[3],
+            )
+        ]
+
     logger.warning(f"Start benchmarking forward streaming_attention {len(configs) = }")
     return configs
 
 
-def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
+def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
     min_size = min(CONTEXT_SIZE, 64)
     max_size = CONTEXT_SIZE * 4
     min_pipeline, max_pipeline = 1, 3
@@ -76,6 +162,21 @@ def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     configs = [i for i in configs if min_size <= i.kwargs['TILE_DK_K_SIZE'] <= max_size]
     configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
     configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
+
+    default_config = _get_default_config_bwd(HEAD_DIM, DTYPE)
+    if default_config is not None:
+        configs += [
+            triton.Config(
+            dict(
+                    PIPELINING=default_config[3],
+                    TILE_Q_SIZE=default_config[0],
+                    TILE_K_SIZE=default_config[1],
+                ),
+                num_warps=default_config[2],
+                num_stages=default_config[3],
+            )
+        ]
+
     logger.warning(f"Start benchmarking backward streaming_attention {len(configs) = }")
     return configs
 
@@ -982,6 +1083,14 @@ def _streaming_attn_bwd_dkdv(
 
 
 class StreamingAttention(torch.autograd.Function):
+    @staticmethod
+    def autotune_prehook(args, reset_only=False):
+        args[3].add_(args[0].size(2)) # L += time
+
+    @staticmethod
+    def autotune_posthook(args, exception=None):
+        args[3].add_(-args[0].size(2)) # L -= time
+
     streaming_forward = triton.heuristics(
         dict(
             PIPELINING=lambda _: 1,
@@ -1015,11 +1124,13 @@ class StreamingAttention(torch.autograd.Function):
         prune_configs_by=dict(
             early_config_prune=fwd_configs_pruner
         ),
+        pre_hook=autotune_prehook,
+        post_hook=autotune_posthook,
     )(
         _streaming_attn_fwd
     )
 
-    streaming_bsckward = triton.heuristics(
+    streaming_backward = triton.heuristics(
         dict(
             PIPELINING=lambda _: 1,
             TILE_DQ_Q_SIZE=lambda args: min(
@@ -1038,7 +1149,7 @@ class StreamingAttention(torch.autograd.Function):
     )(
         _streaming_attn_bwd
     )
-    streaming_bsckward_autotune = triton.autotune(
+    streaming_backward_autotune = triton.autotune(
         configs=[
             triton.Config(
                 dict(
@@ -1062,6 +1173,8 @@ class StreamingAttention(torch.autograd.Function):
         prune_configs_by=dict(
             early_config_prune=bwd_configs_pruner
         ),
+        pre_hook=autotune_prehook,
+        post_hook=autotune_posthook,
     )(
         _streaming_attn_bwd
     )
@@ -1162,7 +1275,7 @@ class StreamingAttention(torch.autograd.Function):
             triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
         )
 
-        fwd_fn = StreamingAttention.streaming_bsckward_autotune if ctx.autotune else StreamingAttention.streaming_bsckward
+        fwd_fn = StreamingAttention.streaming_backward_autotune if ctx.autotune else StreamingAttention.streaming_backward
         fwd_fn[grid](
             q, k, v, lens,
             delta, lse,
@@ -1235,7 +1348,7 @@ def streaming_attention(
 ):
     """
     Computes block-sparse self-attention with chunked attention mask.
-    Time is divided into blovks of `context_size`, query can attend to all kv in the current context
+    Time is divided into blocks of `context_size`, query can attend to all kv in the current context
     and to `back_contexts` contexts before the current one.
 
 
