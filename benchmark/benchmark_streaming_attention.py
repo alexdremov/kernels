@@ -94,6 +94,7 @@ if __name__ == "__main__":
             batch = param["batch"]
 
             x_vals = np.linspace(257, 3000, 6).astype(int).tolist()
+            # x_vals = np.linspace(2400, 3000, 1).astype(int).tolist()
             x_vals = np.unique(x_vals)
             x_vals = sorted(x_vals)
 
@@ -137,7 +138,7 @@ if __name__ == "__main__":
             mean=0.0, std=0.01
         ).requires_grad_()
 
-        lens = torch.randint(1, time + 1, (batch,), dtype=torch.long, device="cuda")
+        lens = None
 
         if "triton" in provider:
             fn = lambda: streaming_attention(q, k, v, lens, context_size, back_contexts)
@@ -154,13 +155,14 @@ if __name__ == "__main__":
             )
             attn_mask = attn_mask.cuda()
 
-            key_padding_mask = (
-                torch.arange(time, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
-            ).unsqueeze(-1)
-            key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
-            attn_mask = attn_mask.unsqueeze(0).unsqueeze(
-                0
-            ) & key_padding_mask.unsqueeze(1)
+            if lens is not None:
+                key_padding_mask = (
+                    torch.arange(time, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+                ).unsqueeze(-1)
+                key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(
+                    0
+                ) & key_padding_mask.unsqueeze(1)
 
             fn = lambda: F.scaled_dot_product_attention(q, k, v, attn_mask)
 
