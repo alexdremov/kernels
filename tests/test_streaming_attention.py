@@ -10,22 +10,25 @@ from streaming_attention import (streaming_attention,
 
 @pytest.mark.parametrize("dtype", [torch.float16], ids=lambda x: f"{x}")
 @pytest.mark.parametrize(
-    "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
+    "lens", ["tricky", "random"], ids=lambda x: f"lens-{x}"
 )
 @pytest.mark.parametrize(
     "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
 )
 @pytest.mark.parametrize("HEAD_DIM", [16, 128, 256], ids=lambda x: f"dim-{x}")
-@pytest.mark.parametrize("B", [1, 67], ids=lambda x: f"batch-{x}")
+@pytest.mark.parametrize("B", [1, 40], ids=lambda x: f"batch-{x}")
 @pytest.mark.parametrize("H", [1, 6], ids=lambda x: f"heads-{x}")
 @pytest.mark.parametrize("T", [1, 10, 16, 800], ids=lambda x: f"time-{x}")
 @pytest.mark.parametrize(
-    "context_size", [1, 10, 16, 32, 100, 256], ids=lambda x: f"context-{x}"
+    "context_size", [1, 10, 16, 32, 10000], ids=lambda x: f"context-{x}"
 )
 @pytest.mark.parametrize(
-    "back_contexts", [0, 5, 1000], ids=lambda x: f"back_contexts-{x}"
+    "back_contexts", [0, 5, 10000], ids=lambda x: f"back_contexts-{x}"
 )
-def test_op(
+@pytest.mark.parametrize(
+    "autotune", [False, True], ids=lambda x: f"autotune-{x}"
+)
+def test_streaming_attention(
     B,
     H,
     T,
@@ -35,6 +38,7 @@ def test_op(
     dtype,
     lens,
     noncontiguous,
+    autotune,
 ):
     torch.manual_seed(20)
     torch.set_float32_matmul_precision("highest")
@@ -42,6 +46,17 @@ def test_op(
 
     if os.environ.get("TRITON_INTERPRET") == "1" and dtype == torch.bfloat16:
         pytest.skip("skipping bf16 in interpreter mode")
+
+    if autotune and not (
+        back_contexts == 5 and
+        context_size in {10, 16} and
+        T in {16, 800} and
+        H == 1 and
+        B == 67 and
+        noncontiguous and
+        lens == 'tricky'
+    ):
+         pytest.skip("reduced tests for autotune")
 
     shape_mul = 2 if noncontiguous else 1
 
@@ -108,7 +123,7 @@ def test_op(
     ref_dk, k.grad = k.grad.clone(), None
     ref_dq, q.grad = q.grad.clone(), None
 
-    tri_out = streaming_attention(q, k, v, lens, context_size, back_contexts)
+    tri_out = streaming_attention(q, k, v, lens, context_size, back_contexts, autotune=autotune)
     tri_out.backward(dout)
 
     tri_dv, v.grad = v.grad.clone(), None

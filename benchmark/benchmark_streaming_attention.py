@@ -1,5 +1,5 @@
-import functools
 import contextlib
+import functools
 import os
 import sys
 

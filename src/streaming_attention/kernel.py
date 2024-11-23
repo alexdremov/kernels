@@ -6,16 +6,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-
-def triton_no_tests_autotune(autotune, heuristics):
-    def wrapper(fn):
-        if "PYTEST_VERSION" in os.environ:
-            return triton.heuristics(heuristics)(fn)
-        return triton.autotune(**autotune)(fn)
-
-    return wrapper
-
-
 MAX_TILE_SIZE = 256
 MIN_TILE_SIZE = 32
 
@@ -85,38 +75,6 @@ def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, **kwargs):
     return configs
 
 
-@triton_no_tests_autotune(
-    autotune=dict(
-        configs=[
-            triton.Config(
-                dict(
-                    PIPELINING=pipe,
-                    TILE_Q_SIZE=tile_q,
-                    TILE_K_SIZE=tile_k,
-                ),
-                num_warps=num_warps,
-                num_stages=pipe,
-            )
-            for num_warps in [4, 8]
-            for pipe in [1, 2, 3]
-            for tile_q in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
-            for tile_k in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
-        ],
-        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
-        prune_configs_by=dict(
-            early_config_prune=fwd_configs_pruner
-        )
-    ),
-    heuristics=dict(
-        PIPELINING=lambda _: 1,
-        TILE_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
-        ),
-        TILE_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
-        ),
-    ),
-)
 @triton.heuristics(
     dict(
         Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_Q_SIZE'] == 0,
@@ -346,23 +304,18 @@ def _streaming_attn_fwd(
             )
 
 
-@triton_no_tests_autotune(
-    autotune=dict(
-        configs=[
-            triton.Config(
-                dict(
-                    TILE_SIZE=tile,
-                ),
-                num_warps=num_warps,
-            )
-            for num_warps in [2, 4, 8]
-            for tile in [32, 64, 128]
-        ],
-        key=["HEAD_DIM", "DTYPE", "TIME_BUCKET"],
-    ),
-    heuristics=dict(
-        TILE_SIZE=lambda _: 64,
-    ),
+@triton.autotune(
+    configs=[
+        triton.Config(
+            dict(
+                TILE_SIZE=tile,
+            ),
+            num_warps=num_warps,
+        )
+        for num_warps in [2, 4, 8]
+        for tile in [32, 64, 128]
+    ],
+    key=["HEAD_DIM", "DTYPE", "TIME_BUCKET"],
 )
 @triton.heuristics(
     dict(
@@ -433,49 +386,6 @@ def _streaming_attn_bwd_precompute(
         tl.store(res_ptr, res, boundary_check=(0,))
 
 
-
-@triton_no_tests_autotune(
-    autotune=dict(
-        configs=[
-            triton.Config(
-                dict(
-                    PIPELINING=pipe,
-                    TILE_DQ_Q_SIZE=tile_qq,
-                    TILE_DQ_K_SIZE=tile_qk,
-                    TILE_DK_Q_SIZE=tile_kq,
-                    TILE_DK_K_SIZE=tile_kk,
-                ),
-                num_warps=num_warps,
-                num_stages=pipe,
-            )
-            for num_warps in [4, 8]
-            for pipe in [1, 2, 3]
-            for tile_qq in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
-            for tile_qk in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
-            for tile_kq in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
-            for tile_kk in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
-        ],
-        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "DTYPE", "TIME_BUCKET"],
-        prune_configs_by=dict(
-            early_config_prune=bwd_configs_pruner
-        )
-    ),
-    heuristics=dict(
-        PIPELINING=lambda _: 1,
-        TILE_DQ_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
-        ),
-        TILE_DQ_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
-        ),
-        TILE_DK_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
-        ),
-        TILE_DK_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
-        ),
-    )
-)
 @triton.heuristics(
     dict(
         RCP_LN2=lambda _: math.log2(math.e),
@@ -1010,8 +920,92 @@ def _streaming_attn_bwd_dkdv(
 
 
 class StreamingAttention(torch.autograd.Function):
+    streaming_forward = triton.heuristics(
+        dict(
+            PIPELINING=lambda _: 1,
+            TILE_Q_SIZE=lambda args: min(
+                64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            ),
+            TILE_K_SIZE=lambda args: min(
+                64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            ),
+        )
+    )(
+        _streaming_attn_fwd
+    )
+    streaming_forward_autotune = triton.autotune(
+        configs=[
+            triton.Config(
+                dict(
+                    PIPELINING=pipe,
+                    TILE_Q_SIZE=tile_q,
+                    TILE_K_SIZE=tile_k,
+                ),
+                num_warps=num_warps,
+                num_stages=pipe,
+            )
+            for num_warps in [4, 8]
+            for pipe in [1, 2, 3]
+            for tile_q in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+            for tile_k in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+        ],
+        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
+        prune_configs_by=dict(
+            early_config_prune=fwd_configs_pruner
+        )
+    )(
+        _streaming_attn_fwd
+    )
+
+    streaming_bsckward = triton.heuristics(
+        dict(
+            PIPELINING=lambda _: 1,
+            TILE_DQ_Q_SIZE=lambda args: min(
+                64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            ),
+            TILE_DQ_K_SIZE=lambda args: min(
+                64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            ),
+            TILE_DK_Q_SIZE=lambda args: min(
+                64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            ),
+            TILE_DK_K_SIZE=lambda args: min(
+                64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))
+            ),
+        )
+    )(
+        _streaming_attn_bwd
+    )
+    streaming_bsckward_autotune = triton.autotune(
+        configs=[
+            triton.Config(
+                dict(
+                    PIPELINING=pipe,
+                    TILE_DQ_Q_SIZE=tile_qq,
+                    TILE_DQ_K_SIZE=tile_qk,
+                    TILE_DK_Q_SIZE=tile_kq,
+                    TILE_DK_K_SIZE=tile_kk,
+                ),
+                num_warps=num_warps,
+                num_stages=pipe,
+            )
+            for num_warps in [4, 8]
+            for pipe in [1, 2, 3]
+            for tile_qq in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+            for tile_qk in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+            for tile_kq in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+            for tile_kk in [2 ** i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)]
+        ],
+        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "DTYPE", "TIME_BUCKET"],
+        prune_configs_by=dict(
+            early_config_prune=bwd_configs_pruner
+        )
+    )(
+        _streaming_attn_bwd
+    )
+
     @staticmethod
-    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor | None, context_size: int, back_contexts: int):
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor | None, context_size: int, back_contexts: int, autotune=True):
         batch, heads, T, HEAD_DIM = q.shape
 
         assert back_contexts >= 0 and context_size >= 1
@@ -1038,7 +1032,8 @@ class StreamingAttention(torch.autograd.Function):
         need_grad = any(i.requires_grad for i in (q, k, v))
 
         kt = k.transpose(-1, -2)  # just stride tricks, same data
-        _streaming_attn_fwd[grid](
+        fwd_fn = StreamingAttention.streaming_forward_autotune if autotune else StreamingAttention.streaming_forward
+        fwd_fn[grid](
             q, kt, v, lens,
             LSE, O,
             *strides(q),
@@ -1065,6 +1060,7 @@ class StreamingAttention(torch.autograd.Function):
         ctx.context_size = context_size
         ctx.back_contexts = back_contexts
         ctx.HEAD_DIM = HEAD_DIM
+        ctx.autotune = autotune
         return O
 
     @staticmethod
@@ -1099,7 +1095,8 @@ class StreamingAttention(torch.autograd.Function):
             triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
         )
 
-        _streaming_attn_bwd[grid](
+        fwd_fn = StreamingAttention.streaming_bsckward_autotune if ctx.autotune else StreamingAttention.streaming_bsckward
+        fwd_fn[grid](
             q, k, v, lens,
             delta, lse,
             do, DQ, DK, DV,
@@ -1124,7 +1121,7 @@ class StreamingAttention(torch.autograd.Function):
             DTYPE=q.dtype,
         )
 
-        return DQ, DK, DV, None, None, None
+        return DQ, DK, DV, None, None, None, None
 
 
 def streaming_attention_reference(q, k, v, context_size, back_contexts, lens):
@@ -1158,7 +1155,18 @@ def streaming_attention_reference(q, k, v, context_size, back_contexts, lens):
     )
 
 
-streaming_attention = StreamingAttention.apply
+def streaming_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor | None,
+    context_size: int,
+    back_contexts: int,
+    autotune=True,
+):
+    return StreamingAttention.apply(
+        q, k, v, lens, context_size, back_contexts, autotune
+    )
 
 
 if __name__ == "__main__":
