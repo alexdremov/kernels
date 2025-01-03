@@ -1092,14 +1092,14 @@ def _streaming_attn_bwd_dkdv(
     return dk, dv
 # fmt: on
 
-def autotune_prehook(args, reset_only=False):
-    if args[3] is not None:
-        args[3].add_(args[0].size(2))  # L += time
+def autotune_prehook(kwargs, reset_only=False):
+    if kwargs['L'] is not None:
+        kwargs['L'].add_(kwargs['q'].size(2))  # L += time
 
 
-def autotune_posthook(args, exception=None):
-    if args[3] is not None:
-        args[3].add_(-args[0].size(2))  # L -= time
+def autotune_posthook(kwargs, exception=None):
+    if kwargs['L'] is not None:
+        kwargs['L'].add_(-kwargs['q'].size(2))  # L -= time
 
 
 streaming_forward = triton.heuristics(
@@ -1121,7 +1121,7 @@ streaming_forward_autotune = triton.autotune(
             num_stages=pipe,
         )
         for num_warps in [4, 8]
-        for pipe in [1, 2, 3]
+        for pipe in [1, 2]
         for tile_q in [
             2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
         ]

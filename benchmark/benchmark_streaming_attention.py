@@ -192,9 +192,10 @@ if __name__ == "__main__":
                 device=device,
                 B=len(lens) if lens is not None else None,
                 H=None,  # invariant
-                Q_LEN=max_time,
-                KV_LEN=max_time,
+                Q_LEN=q.shape[2],
+                KV_LEN=k.shape[2],
                 BLOCK_SIZE=sparse_block_size,  # this is crucial to have full blocks
+                _compile="compile" in provider
             )
 
             if "compile" in provider:
