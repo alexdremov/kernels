@@ -86,6 +86,7 @@ def _get_default_config_bwd(head_dim, dtype) -> tuple[int, int, int, int]:
 
 
 def strides(t):
+    assert t is not None
     return [t.stride(i) for i in range(t.ndim)]
 
 
@@ -225,8 +226,11 @@ def _streaming_attn_fwd(
     q_tile_idx = tl.program_id(2)
     q_token_idx = q_tile_idx * TILE_Q_SIZE
 
-    seq_len = tl.load(L + batch * lens_stride)
-    seq_len = min(seq_len, T)
+    if L is not None:
+        seq_len = tl.load(L + batch * lens_stride)
+        seq_len = min(seq_len, T)
+    else:
+        seq_len = T
     if seq_len <= q_token_idx:
         return
 
@@ -549,8 +553,11 @@ def _streaming_attn_bwd(
     dkv_worker = tl.program_id(2) >= DQ_TILES_NUM
     tile_id = tl.program_id(2) - (DQ_TILES_NUM * dkv_worker)
 
-    seq_len = tl.load(L + batch * lens_stride)
-    seq_len = min(seq_len, T)
+    if L is not None:
+        seq_len = tl.load(L + batch * lens_stride)
+        seq_len = min(seq_len, T)
+    else:
+        seq_len = T
 
     if dkv_worker:
         _streaming_attn_bwd_dkdv_inner(
@@ -1085,237 +1092,338 @@ def _streaming_attn_bwd_dkdv(
     return dk, dv
 # fmt: on
 
+def autotune_prehook(args, reset_only=False):
+    args[3].add_(args[0].size(2))  # L += time
 
-class StreamingAttention(torch.autograd.Function):
-    @staticmethod
-    def autotune_prehook(args, reset_only=False):
-        args[3].add_(args[0].size(2))  # L += time
 
-    @staticmethod
-    def autotune_posthook(args, exception=None):
-        args[3].add_(-args[0].size(2))  # L -= time
+def autotune_posthook(args, exception=None):
+    args[3].add_(-args[0].size(2))  # L -= time
 
-    streaming_forward = triton.heuristics(
-        dict(
-            PIPELINING=lambda _: 1,
-            TILE_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-            TILE_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+
+streaming_forward = triton.heuristics(
+    dict(
+        PIPELINING=lambda _: 1,
+        TILE_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+        TILE_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+    )
+)(_streaming_attn_fwd)
+streaming_forward_autotune = triton.autotune(
+    configs=[
+        triton.Config(
+            dict(
+                PIPELINING=pipe,
+                TILE_Q_SIZE=tile_q,
+                TILE_K_SIZE=tile_k,
+            ),
+            num_warps=num_warps,
+            num_stages=pipe,
         )
-    )(_streaming_attn_fwd)
-    streaming_forward_autotune = triton.autotune(
-        configs=[
-            triton.Config(
-                dict(
-                    PIPELINING=pipe,
-                    TILE_Q_SIZE=tile_q,
-                    TILE_K_SIZE=tile_k,
-                ),
-                num_warps=num_warps,
-                num_stages=pipe,
-            )
-            for num_warps in [4, 8]
-            for pipe in [1, 2, 3]
-            for tile_q in [
-                2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
-            ]
-            for tile_k in [
-                2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
-            ]
-        ],
-        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
-        prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
-        pre_hook=autotune_prehook,
-        post_hook=autotune_posthook,
-    )(_streaming_attn_fwd)
+        for num_warps in [4, 8]
+        for pipe in [1, 2, 3]
+        for tile_q in [
+            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+        ]
+        for tile_k in [
+            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+        ]
+    ],
+    key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
+    prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
+    pre_hook=autotune_prehook,
+    post_hook=autotune_posthook,
+)(_streaming_attn_fwd)
 
-    streaming_backward = triton.heuristics(
-        dict(
-            PIPELINING=lambda _: 1,
-            TILE_DQ_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-            TILE_DQ_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-            TILE_DK_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-            TILE_DK_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+streaming_backward = triton.heuristics(
+    dict(
+        PIPELINING=lambda _: 1,
+        TILE_DQ_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+        TILE_DQ_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+        TILE_DK_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+        TILE_DK_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+    )
+)(_streaming_attn_bwd)
+streaming_backward_autotune = triton.autotune(
+    configs=[
+        triton.Config(
+            dict(
+                PIPELINING=pipe,
+                TILE_DQ_Q_SIZE=tile_qq,
+                TILE_DQ_K_SIZE=tile_qk,
+                TILE_DK_Q_SIZE=tile_kq,
+                TILE_DK_K_SIZE=tile_kk,
+            ),
+            num_warps=num_warps,
+            num_stages=pipe,
         )
-    )(_streaming_attn_bwd)
-    streaming_backward_autotune = triton.autotune(
-        configs=[
-            triton.Config(
-                dict(
-                    PIPELINING=pipe,
-                    TILE_DQ_Q_SIZE=tile_qq,
-                    TILE_DQ_K_SIZE=tile_qk,
-                    TILE_DK_Q_SIZE=tile_kq,
-                    TILE_DK_K_SIZE=tile_kk,
-                ),
-                num_warps=num_warps,
-                num_stages=pipe,
-            )
-            for num_warps in [4, 8]
-            for pipe in [1, 2, 3]
-            for tile_qq in [
-                2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
-            ]
-            for tile_qk in [
-                2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
-            ]
-            for tile_kq in [
-                2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
-            ]
-            for tile_kk in [
-                2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
-            ]
-        ],
-        key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "DTYPE", "TIME_BUCKET"],
-        prune_configs_by=dict(early_config_prune=bwd_configs_pruner),
-        pre_hook=autotune_prehook,
-        post_hook=autotune_posthook,
-    )(_streaming_attn_bwd)
+        for num_warps in [4, 8]
+        for pipe in [1, 2, 3]
+        for tile_qq in [
+            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+        ]
+        for tile_qk in [
+            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+        ]
+        for tile_kq in [
+            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+        ]
+        for tile_kk in [
+            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+        ]
+    ],
+    key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "DTYPE", "TIME_BUCKET"],
+    prune_configs_by=dict(early_config_prune=bwd_configs_pruner),
+    pre_hook=autotune_prehook,
+    post_hook=autotune_posthook,
+)(_streaming_attn_bwd)
 
-    @staticmethod
-    def forward(
-        ctx,
+
+@torch.library.custom_op("alexdremov_streaming_attention::forward", mutates_args=(), device_types=("cuda",))
+def attention_forward_adapter(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        lens: torch.Tensor,
+        context_size: int,
+        back_contexts: int,
+        sm_scale: float,
+        autotune: bool,
+        return_lse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, heads, T, HEAD_DIM = q.shape
+
+    assert back_contexts >= 0 and context_size >= 1
+    assert HEAD_DIM in {16, 32, 64, 128, 256}
+    assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
+    assert T == k.shape[-2] and T == v.shape[-2]
+    assert sm_scale is not None
+    assert lens is None or (lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1)
+
+    O = torch.zeros_like(q, memory_format=torch.contiguous_format)
+    LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
+
+    INPUT_PRECISION = "ieee"
+    if not torch.compiler.is_compiling():
+        INPUT_PRECISION = ("tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee")
+
+    grid = lambda args: (
+        batch,
+        heads,
+        triton.cdiv(T, args["TILE_Q_SIZE"]),
+    )
+
+    need_grad = any(i.requires_grad for i in (q, k, v))
+
+    kt = k.transpose(-1, -2)  # just stride tricks, same data
+    fwd_fn = streaming_forward_autotune if autotune else streaming_forward
+    fwd_fn[grid](
+        q,
+        kt,
+        v,
+        lens,
+        LSE,
+        O,
+        *strides(q),
+        *strides(kt),
+        *strides(v),
+        *strides(LSE),
+        *strides(O),
+        *(strides(lens) if lens is not None else [0]),
+        T=T,
+        HEAD_DIM=HEAD_DIM,
+        CONTEXT_SIZE=context_size,
+        CONTEXTS_BACK=back_contexts,
+        INPUT_PRECISION=INPUT_PRECISION,
+        PRESCALE_QK=True,
+        DTYPE=q.dtype,
+        TIME_BUCKET=triton.next_power_of_2(T),
+        OUTPUT_LOGSUMEXP=(need_grad or return_lse),
+        SM_SCALE=sm_scale,
+    )
+    return O, LSE
+
+
+@torch.library.register_fake("alexdremov_streaming_attention::forward")
+def attention_forward_adapter_abstract(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         lens: torch.Tensor | None,
         context_size: int,
         back_contexts: int,
-        sm_scale: int | None,
+        sm_scale: float | None,
         autotune: bool,
-    ):
-        batch, heads, T, HEAD_DIM = q.shape
+        return_lse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(q, memory_format=torch.contiguous_format),
+        torch.empty(q.shape[:3], dtype=torch.float32, device=q.device),
+    )
 
-        assert back_contexts >= 0 and context_size >= 1
-        assert HEAD_DIM in {16, 32, 64, 128, 256}
-        assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
-        assert T == k.shape[-2] and T == v.shape[-2]
 
-        if lens is None:
-            lens = torch.tensor([T], dtype=torch.int32, device=q.device).repeat(batch)
-        else:
-            lens = torch.as_tensor(lens, dtype=torch.int32)
+@torch.library.custom_op("alexdremov_streaming_attention::backward", mutates_args=(), device_types=("cuda",))
+def attention_backward_adapter(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        lens: torch.Tensor,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        do: torch.Tensor,
+        context_size: int,
+        back_contexts: int,
+        sm_scale: float,
+        autotune: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, heads, T, HEAD_DIM = q.shape
 
-        assert lens is None or (lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1)
+    delta = torch.empty(o.shape[:-1], dtype=torch.float32, device=o.device)
+    grid = lambda args: (
+        batch,
+        heads,
+        triton.cdiv(T, args["TILE_SIZE"]),
+    )
+    _streaming_attn_bwd_precompute[grid](
+        o,
+        do,
+        delta,
+        *strides(o),
+        *strides(do),
+        *strides(delta),
+        T=T,
+        HEAD_DIM=HEAD_DIM,
+        DTYPE=q.dtype,
+        TIME_BUCKET=triton.next_power_of_2(T),
+    )
 
-        O = torch.zeros_like(q, memory_format=torch.contiguous_format)
-        LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
+    DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
+    DK = torch.zeros_like(k, memory_format=torch.contiguous_format)
+    DV = torch.zeros_like(v, memory_format=torch.contiguous_format)
 
-        if sm_scale is None:
-            sm_scale = HEAD_DIM**-0.5
+    INPUT_PRECISION = "ieee"
+    if not torch.compiler.is_compiling():
+        INPUT_PRECISION = ("tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee")
 
-        grid = lambda args: (
-            batch,
-            heads,
-            triton.cdiv(T, args["TILE_Q_SIZE"]),
-        )
 
-        need_grad = any(i.requires_grad for i in (q, k, v))
+    grid = lambda args: (
+        batch,
+        heads,
+        triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
+    )
 
-        kt = k.transpose(-1, -2)  # just stride tricks, same data
-        fwd_fn = StreamingAttention.streaming_forward_autotune if autotune else StreamingAttention.streaming_forward
-        fwd_fn[grid](
-            q,
-            kt,
-            v,
-            lens,
-            LSE,
-            O,
-            *strides(q),
-            *strides(kt),
-            *strides(v),
-            *strides(LSE),
-            *strides(O),
-            *strides(lens),
-            T=T,
-            HEAD_DIM=HEAD_DIM,
-            CONTEXT_SIZE=context_size,
-            CONTEXTS_BACK=back_contexts,
-            INPUT_PRECISION=("tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"),
-            PRESCALE_QK=True,
-            DTYPE=q.dtype,
-            TIME_BUCKET=triton.next_power_of_2(T),
-            OUTPUT_LOGSUMEXP=need_grad,
-            SM_SCALE=sm_scale,
-        )
+    fwd_fn = (
+        streaming_backward_autotune if autotune else streaming_backward
+    )
+    fwd_fn[grid](
+        q,
+        k,
+        v,
+        lens,
+        delta,
+        lse,
+        do,
+        DQ,
+        DK,
+        DV,
+        *strides(q),
+        *strides(k),
+        *strides(v),
+        *strides(delta),
+        *strides(lse),
+        *strides(do),
+        *strides(DQ),
+        *strides(DK),
+        *strides(DV),
+        *(strides(lens) if lens is not None else [0]),
+        T=T,
+        HEAD_DIM=HEAD_DIM,
+        CONTEXT_SIZE=context_size,
+        CONTEXTS_BACK=back_contexts,
+        TIME_BUCKET=triton.next_power_of_2(T),
+        INPUT_PRECISION=INPUT_PRECISION,
+        DTYPE=q.dtype,
+        SM_SCALE=sm_scale,
+    )
 
-        ctx.save_for_backward(q, k, v, O, LSE, lens)
-        ctx.grid = grid
-        ctx.context_size = context_size
-        ctx.back_contexts = back_contexts
-        ctx.HEAD_DIM = HEAD_DIM
-        ctx.autotune = autotune
-        ctx.sm_scale = sm_scale
-        return O
+    return DQ, DK, DV
 
-    @staticmethod
-    def backward(ctx, do):
-        q, k, v, o, lse, lens = ctx.saved_tensors
-        batch, heads, T, HEAD_DIM = q.shape
 
-        delta = torch.empty(o.shape[:-1], dtype=torch.float32, device=o.device)
-        grid = lambda args: (
-            batch,
-            heads,
-            triton.cdiv(T, args["TILE_SIZE"]),
-        )
-        _streaming_attn_bwd_precompute[grid](
-            o,
-            do,
-            delta,
-            *strides(o),
-            *strides(do),
-            *strides(delta),
-            T=T,
-            HEAD_DIM=HEAD_DIM,
-            DTYPE=q.dtype,
-            TIME_BUCKET=triton.next_power_of_2(T),
-        )
+@torch.library.register_fake("alexdremov_streaming_attention::backward")
+def attention_backward_adapter_abstract(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        lens: torch.Tensor | None,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        do: torch.Tensor,
+        context_size: int,
+        back_contexts: int,
+        sm_scale: float | None,
+        autotune: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
+    DK = torch.empty_like(k, memory_format=torch.contiguous_format)
+    DV = torch.empty_like(v, memory_format=torch.contiguous_format)
+    return DQ, DK, DV
 
-        DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
-        DK = torch.zeros_like(k, memory_format=torch.contiguous_format)
-        DV = torch.zeros_like(v, memory_format=torch.contiguous_format)
 
-        grid = lambda args: (
-            batch,
-            heads,
-            triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
-        )
+def attention_backward_adapter_op_setup_context(ctx, inputs, output):
+    O, LSE = output
+    (
+        q,
+        k,
+        v,
+        lens,
+        context_size,
+        back_contexts,
+        sm_scale,
+        autotune,
+        return_lse
+    )= inputs
+    ctx.save_for_backward(
+        q,
+        k,
+        v,
+        O,
+        LSE,
+        lens,
+    )
+    ctx.context_size = context_size
+    ctx.back_contexts = back_contexts
+    ctx.autotune = autotune
+    ctx.sm_scale = sm_scale
 
-        fwd_fn = (
-            StreamingAttention.streaming_backward_autotune if ctx.autotune else StreamingAttention.streaming_backward
-        )
-        fwd_fn[grid](
-            q,
-            k,
-            v,
-            lens,
-            delta,
-            lse,
-            do,
-            DQ,
-            DK,
-            DV,
-            *strides(q),
-            *strides(k),
-            *strides(v),
-            *strides(delta),
-            *strides(lse),
-            *strides(do),
-            *strides(DQ),
-            *strides(DK),
-            *strides(DV),
-            *strides(lens),
-            T=T,
-            HEAD_DIM=HEAD_DIM,
-            CONTEXT_SIZE=ctx.context_size,
-            CONTEXTS_BACK=ctx.back_contexts,
-            TIME_BUCKET=triton.next_power_of_2(T),
-            INPUT_PRECISION=("tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"),
-            DTYPE=q.dtype,
-            SM_SCALE=ctx.sm_scale,
-        )
 
-        return DQ, DK, DV, None, None, None, None, None
+def attention_backward_adapter_op(ctx, do, *grads):
+    q, k, v, o, lse, lens = ctx.saved_tensors
+    context_size = ctx.context_size
+    back_contexts = ctx.back_contexts
+    autotune = ctx.autotune
+    sm_scale = ctx.sm_scale
+    batch, heads, T, HEAD_DIM = q.shape
+
+    DQ, DK, DV = torch.ops.alexdremov_streaming_attention.backward(
+        q=q,
+        k=k,
+        v=v,
+        lens=lens,
+        o=o,
+        lse=lse,
+        do=do,
+        context_size=context_size,
+        back_contexts=back_contexts,
+        sm_scale=sm_scale,
+        autotune=autotune,
+    )
+
+    return DQ, DK, DV, None, None, None, None, None, None
+
+
+torch.library.register_autograd(
+    "alexdremov_streaming_attention::forward",
+    attention_backward_adapter_op,
+    setup_context=attention_backward_adapter_op_setup_context
+)
 
 
 def streaming_attention_reference(q, k, v, context_size, back_contexts, lens):
@@ -1345,6 +1453,34 @@ def streaming_attention_reference(q, k, v, context_size, back_contexts, lens):
     )
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def _streaming_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor | None,
+    context_size: int,
+    back_contexts: int,
+    sm_scale: float | None,
+    autotune: bool,
+    return_lse: bool,
+):
+    O, LSE = torch.ops.alexdremov_streaming_attention.forward(
+        q,
+        k,
+        v,
+        lens,
+        context_size,
+        back_contexts,
+        sm_scale,
+        autotune,
+        return_lse,
+    )
+    if return_lse:
+        return O, LSE
+    return O
+
+
 def streaming_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1354,6 +1490,7 @@ def streaming_attention(
     back_contexts: int,
     sm_scale: float | None = None,
     autotune=True,
+    return_lse=False,
 ):
     """
     Computes block-sparse self-attention with chunked attention mask.
@@ -1374,7 +1511,24 @@ def streaming_attention(
         sm_scale (float): Softmax scale, head_dim ** -0.5 by default
         autotune (bool): Use triton autotune for optimal kernel configuration
     """
-    return StreamingAttention.apply(q, k, v, lens, context_size, back_contexts, sm_scale, autotune)
+    if not torch.compiler.is_compiling():
+        for i in (q, k, v):
+            torch._dynamo.mark_static(i, 1)
+            torch._dynamo.mark_static(i, 3)
+    if sm_scale is None:
+        HEAD_DIM = q.size(-1)
+        sm_scale = HEAD_DIM ** -0.5
+    return _streaming_attention(
+        q=q,
+        k=k,
+        v=v,
+        lens=lens,
+        context_size=context_size,
+        back_contexts=back_contexts,
+        sm_scale=sm_scale,
+        autotune=autotune,
+        return_lse=return_lse,
+    )
 
 
 if __name__ == "__main__":
@@ -1386,6 +1540,17 @@ if __name__ == "__main__":
     B, H, T, D = 7, 1, 1, 128
     context, back = 10, 9
 
-    from tests.test_streaming_attention import test_op
+    from tests.test_streaming_attention import test_streaming_attention
 
-    test_op(B, H, T, D, context, back, dtype=torch.float16, lens='none')
+    test_streaming_attention(
+        B=B,
+        H=H,
+        T=T,
+        HEAD_DIM=D,
+        context_size=context,
+        back_contexts=back,
+        dtype=torch.float32,
+        lens='none',
+        noncontiguous=False,
+        autotune=False,
+    )

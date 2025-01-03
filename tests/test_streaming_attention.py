@@ -10,7 +10,7 @@ from streaming_attention import (streaming_attention,
 
 @pytest.mark.parametrize("dtype", [torch.float16], ids=lambda x: f"{x}")
 @pytest.mark.parametrize(
-    "lens", ["tricky", "random"], ids=lambda x: f"lens-{x}"
+    "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
 )
 @pytest.mark.parametrize(
     "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
@@ -40,6 +40,8 @@ def test_streaming_attention(
     noncontiguous,
     autotune,
 ):
+    torch._dynamo.reset()
+
     torch.manual_seed(20)
     torch.set_float32_matmul_precision("highest")
     torch.cuda.empty_cache()
@@ -56,7 +58,7 @@ def test_streaming_attention(
         noncontiguous and
         lens == 'tricky'
     ):
-         pytest.skip("reduced tests for autotune")
+        pytest.skip("reduced tests for autotune")
 
     shape_mul = 2 if noncontiguous else 1
 
@@ -161,3 +163,39 @@ def test_streaming_attention(
             rtol=0,
             msg=lambda x: f"error in d{'kvq'[i]}\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(d_tri - d_ref)[errors].view(-1)}\n\nlens:\n{lens}\n{mean_err = }"
         )
+
+
+@pytest.mark.parametrize(
+    "lens_mode", ["none", "random"], ids=lambda x: f"lens-{x}"
+)
+def test_streaming_attention_dynamic(lens_mode):
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters['stats'].clear()
+
+    # https://github.com/pytorch/pytorch/issues/124565#issuecomment-2070891266
+    torch.empty(1, device='cuda', requires_grad=True).backward()
+
+    H, HEAD_DIM = 4, 32,
+    for B in range(1, 1024, 32):
+        for T in range(1, 1024, 32):
+            q, k, v = [
+                torch.testing.make_tensor(
+                    (B, H, T, HEAD_DIM),
+                    dtype=torch.float16,
+                    device="cuda",
+                    requires_grad=True,
+                    noncontiguous=False,
+                    low=-0.01,
+                    high=0.01
+                )
+                for _ in range(3)
+            ]
+            lens = None
+            if lens_mode == "random":
+                lens = torch.randint(1, T + 1, (B, ), dtype=torch.int32, device=q.device)
+
+            tri_out = streaming_attention(q, k, v, lens, context_size=16, back_contexts=2, autotune=False)
+            dout = torch.randn_like(tri_out, device=q.device)
+            tri_out.backward(dout)
+
+            assert torch._dynamo.utils.counters['stats']['unique_graphs'] <= 4
