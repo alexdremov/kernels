@@ -1093,11 +1093,13 @@ def _streaming_attn_bwd_dkdv(
 # fmt: on
 
 def autotune_prehook(args, reset_only=False):
-    args[3].add_(args[0].size(2))  # L += time
+    if args[3] is not None:
+        args[3].add_(args[0].size(2))  # L += time
 
 
 def autotune_posthook(args, exception=None):
-    args[3].add_(-args[0].size(2))  # L -= time
+    if args[3] is not None:
+        args[3].add_(-args[0].size(2))  # L -= time
 
 
 streaming_forward = triton.heuristics(
