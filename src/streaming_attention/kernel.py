@@ -231,6 +231,7 @@ def _streaming_attn_fwd(
         seq_len = min(seq_len, T)
     else:
         seq_len = T
+
     if seq_len <= q_token_idx:
         return
 
@@ -303,9 +304,10 @@ def _streaming_attn_fwd(
     for kv_tile_idx in tl.range(
         kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
     ):
+        last_iter = kv_tile_idx + 1 == kv_end_tile_idx
         kv_token_idx = kv_tile_idx * TILE_K_SIZE
 
-        if K_BLOCK_DIVISIBLE:
+        if K_BLOCK_DIVISIBLE or not last_iter:
             kt_tile = tl.load(
                 tl.advance(kt_tile_ptr, (0, kv_token_idx)),
             )

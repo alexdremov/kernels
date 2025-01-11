@@ -6,7 +6,8 @@ import torch
 
 from self_attention import (
     self_attention,
-    self_attention_reference
+    self_attention_reference,
+    self_attention_reference_naive
 )
 
 

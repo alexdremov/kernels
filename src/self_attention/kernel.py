@@ -69,9 +69,8 @@ def strides(t):
     return [t.stride(i) for i in range(t.ndim)]
 
 
-def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
-    min_size = min(CONTEXT_SIZE, 64)
-    max_size = CONTEXT_SIZE * 4
+def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
+    min_size, max_size = 16, 256
     min_pipeline, max_pipeline = 1, 3
     min_warps, max_warps = 1, 8
 
@@ -80,7 +79,7 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
     elif HEAD_DIM == 128:
         max_size = 128
         min_size = 32
-        max_pipeline = 2
+        max_pipeline = 3
         max_warps = 4
     elif HEAD_DIM == 256:
         max_size = 128
@@ -101,10 +100,12 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
                     PIPELINING=default_config[3],
                     TILE_Q_SIZE=default_config[0],
                     TILE_K_SIZE=default_config[1],
+                    V_PRELOAD=V_PRELOAD,
                 ),
                 num_warps=default_config[2],
                 num_stages=default_config[3],
             )
+            for V_PRELOAD in (True, False)
         ]
 
     logger.warning(f"Start benchmarking forward streaming_attention {len(configs) = }")
@@ -115,6 +116,7 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
 @triton.heuristics(
     dict(
         RCP_LN2=lambda _: math.log2(math.e),
+        V_PRELOAD=lambda _: True,
     )
 )
 @triton.jit
@@ -128,6 +130,7 @@ def _self_attn_fwd(
     lens_stride: int,
     T: int,  #
     TIME_BUCKET:  int,  #
+    LEN_PRESENT: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
@@ -135,6 +138,7 @@ def _self_attn_fwd(
     TILE_Q_SIZE: tl.constexpr,  #
     TILE_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
+    V_PRELOAD: tl.constexpr,  #
     RCP_LN2: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
@@ -142,11 +146,14 @@ def _self_attn_fwd(
     q_tile_idx = tl.program_id(2)
     q_token_idx = q_tile_idx * TILE_Q_SIZE
 
-    if L is not None:
+    if LEN_PRESENT:
         seq_len = tl.load(L + batch * lens_stride)
         seq_len = min(seq_len, T)
+        need_q_mask = q_token_idx + TILE_Q_SIZE >= seq_len
     else:
         seq_len = T
+        need_q_mask = False
+
     if seq_len <= q_token_idx:
         return
 
@@ -185,9 +192,6 @@ def _self_attn_fwd(
     acc = tl.zeros([TILE_Q_SIZE, HEAD_DIM], dtype=tl.float32)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
-    q_lens_mask = (
-        q_tile_indices[:, None] < seq_len
-    )
 
     q_tile = tl.load(
         q_tile_ptr,
@@ -197,30 +201,45 @@ def _self_attn_fwd(
     softmax_scale: tl.constexpr = tl.cast(SM_SCALE * RCP_LN2, q_tile.dtype)
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
 
+    max_tile = tl.cdiv(seq_len, TILE_K_SIZE)
     for kv_tile_idx in tl.range(
-        0, tl.cdiv(seq_len, TILE_K_SIZE), num_stages=PIPELINING
+        0, max_tile, num_stages=PIPELINING
     ):
+        last_iter = kv_tile_idx == max_tile - 1
         kv_token_idx = kv_tile_idx * TILE_K_SIZE
 
-        kt_tile = tl.load(
-            tl.advance(kt_tile_ptr, (0, kv_token_idx)),
-            boundary_check=(1,),
-        )
-        v_tile = tl.load(
-            tl.advance(v_tile_ptr, (kv_token_idx, 0)),
-            boundary_check=(0,),
-        )
+        if last_iter:
+            kt_tile = tl.load(
+                tl.advance(kt_tile_ptr, (0, kv_token_idx)),
+                boundary_check=(1,),
+            )
+        else:
+            kt_tile = tl.load(
+                tl.advance(kt_tile_ptr, (0, kv_token_idx)),
+            )
+        if V_PRELOAD:
+            if last_iter:
+                v_tile = tl.load(
+                    tl.advance(v_tile_ptr, (kv_token_idx, 0)),
+                    boundary_check=(0,),
+                )
+            else:
+                v_tile = tl.load(
+                    tl.advance(v_tile_ptr, (kv_token_idx, 0)),
+                )
 
         qk = tl.dot(
             q_tile * softmax_scale, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
         )
 
-        kv_indices = kv_token_idx + tile_k_arange
-        mask = q_lens_mask & (
-            kv_indices[None, :] < seq_len
-        )
+        if last_iter:
+            kv_indices = kv_token_idx + tile_k_arange
 
-        qk = tl.where(mask, qk, tl.cast(-float("inf"), qk.dtype))
+            mask = (
+                kv_indices[None, :] < seq_len
+            )
+
+            qk = tl.where(mask, qk, tl.cast(-float("inf"), qk.dtype))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.math.exp2(qk - m_ij[:, None])
@@ -231,6 +250,16 @@ def _self_attn_fwd(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
+        if not V_PRELOAD:
+            if last_iter:
+                v_tile = tl.load(
+                    tl.advance(v_tile_ptr, (kv_token_idx, 0)),
+                    boundary_check=(0,),
+                )
+            else:
+                v_tile = tl.load(
+                    tl.advance(v_tile_ptr, (kv_token_idx, 0)),
+                )
         acc = tl.dot(
             p.to(v_tile.dtype),
             v_tile,
@@ -241,7 +270,11 @@ def _self_attn_fwd(
         m_i = m_ij
 
     acc = acc / l_i[:, None]
-    acc = tl.where(q_lens_mask, acc, 0.0)
+    if need_q_mask:
+        q_lens_mask = (
+            q_tile_indices[:, None] < seq_len
+        )
+        acc = tl.where(q_lens_mask, acc, 0.0)
 
     obatch_head_offset = batch * stride_ob + head * stride_oh
     o_tile_ptr = tl.make_block_ptr(
@@ -283,6 +316,7 @@ streaming_forward_autotune = triton.autotune(
                 PIPELINING=pipe,
                 TILE_Q_SIZE=tile_q,
                 TILE_K_SIZE=tile_k,
+                V_PRELOAD=V_PRELOAD,
             ),
             num_warps=num_warps,
             num_stages=pipe,
@@ -295,6 +329,7 @@ streaming_forward_autotune = triton.autotune(
         for tile_k in [
             2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
         ]
+        for V_PRELOAD in (True, False)
     ],
     key=["HEAD_DIM", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
     prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
@@ -347,6 +382,7 @@ def attention_forward_adapter(
         INPUT_PRECISION=INPUT_PRECISION,
         DTYPE=q.dtype,
         TIME_BUCKET=triton.next_power_of_2(T),
+        LEN_PRESENT=lens is not None,
         SM_SCALE=sm_scale,
     )
     return O
@@ -384,6 +420,32 @@ def self_attention_reference(q, k, v, lens):
 
     return (
         F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask) * res_mask,
+        res_mask,
+    )
+
+
+def self_attention_reference_naive(q, k, v, lens):
+    T = q.shape[-2]
+    D = q.shape[-1]
+
+    attn_mask = None
+    if lens is not None:
+        key_padding_mask = (torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)).unsqueeze(-1)
+        key_padding_mask_ref = key_padding_mask
+        key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
+        attn_mask = key_padding_mask.unsqueeze(1)
+        res_mask = key_padding_mask_ref.unsqueeze(1)
+    else:
+        res_mask = torch.tensor([True], device="cuda")
+
+    qkt = (q / (D ** 0.5)) @ k.transpose(-1, -2)
+    if attn_mask is not None:
+        qkt = torch.where(attn_mask, qkt, -float('inf'))
+    scores = F.softmax(qkt, dim=-1)
+    result = scores @ v
+
+    return (
+        torch.where(res_mask, result, 0),
         res_mask,
     )
 

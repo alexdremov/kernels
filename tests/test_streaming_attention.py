@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from streaming_attention import (streaming_attention,
-                                 streaming_attention_reference)
+                                 streaming_attention_reference,)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16], ids=lambda x: f"{x}")
