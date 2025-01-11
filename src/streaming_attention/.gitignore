@@ -1,0 +1,11 @@
+*.pyc
+.vscode
+.venv
+.history
+__pycache__
+.pytest*
+*.png
+*.csv
+*.html
+dist
+*.egg-info

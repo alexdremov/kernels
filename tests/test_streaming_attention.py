@@ -135,7 +135,7 @@ def test_streaming_attention(
     # torch.set_printoptions(linewidth=400, profile="full")
 
     tri_out = tri_out * res_mask.broadcast_to(tri_out.shape)
-    atol = 1e-2
+    atol = 1e-3
     errors = abs(tri_out - ref) > atol
     b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
     h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()

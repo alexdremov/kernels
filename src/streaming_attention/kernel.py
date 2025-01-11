@@ -322,10 +322,11 @@ def _streaming_attn_fwd(
                 boundary_check=(0,),
             )
 
+        q_tile_scaled = q_tile
         if PRESCALE_QK:
-            q_tile = q_tile * softmax_scale
+            q_tile_scaled = q_tile * softmax_scale
         qk = tl.dot(
-            q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
+            q_tile_scaled, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
         )
 
         kv_indices = kv_token_idx + tile_k_arange
