@@ -7,4 +7,4 @@ I write kernels here
 - [Streaming Attention (forward, backward, pt2 compliant)](https://github.com/alexdremov/kernels/blob/main/src/streaming_attention/kernel.py)
   - [detailed description in the docstring](https://github.com/alexdremov/kernels/blob/9d2fde773ee9bfc8c838fb6cad741323b7e02afb/src/streaming_attention/kernel.py#L1489)
   - TBD: guide to why it is cool (nudge me if interested)
-  - backward pass has accurracy bug somewhere 
+  - backward pass has accuracy bug somewhere 
