@@ -1048,7 +1048,6 @@ def _streaming_attn_bwd_dkdv(
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
     kv_context_indices = kv_indices // CONTEXT_SIZE
 
-    softmax_scale: tl.constexpr = tl.cast(SM_SCALE, k.dtype)
     tile_q_arange = tl.arange(0, TILE_Q_SIZE)
 
     kv_lens_mask = (
@@ -1056,7 +1055,7 @@ def _streaming_attn_bwd_dkdv(
     )
 
     if PRESCALE_QK:
-        k = k * RCP_LN2 * softmax_scale
+        k *= RCP_LN2 * SM_SCALE
 
     for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
@@ -1097,7 +1096,7 @@ def _streaming_attn_bwd_dkdv(
 
         qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         if not PRESCALE_QK:
-            qkT = qkT * RCP_LN2 * softmax_scale
+            qkT *= RCP_LN2 * SM_SCALE
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tile_q_arange
@@ -1111,14 +1110,14 @@ def _streaming_attn_bwd_dkdv(
             mask &= streaming_mask
         pT = tl.where(mask, pT, 0.0)
 
-        dv = tl.dot(pT.to(do.dtype), do, dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         tl.static_assert(Di.dtype == tl.float32)
 
         # Compute dP and dS.
         dpT = tl.dot(v.to(do.dtype), tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         dsT = pT * (dpT - Di[None, :])
         dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-    dk *= softmax_scale
+    dk *= SM_SCALE
     return dk, dv
 # fmt: on
 

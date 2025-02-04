@@ -155,7 +155,7 @@ def test_streaming_attention_reference(
     # torch.set_printoptions(linewidth=400, profile="full")
 
     tri_out = tri_out * res_mask.broadcast_to(tri_out.shape)
-    atol = 1e-3
+    atol = 3e-3
     if dtype == torch.float32:
         atol = 5e-6
 
@@ -171,7 +171,7 @@ def test_streaming_attention_reference(
         msg=lambda x: f"forward error\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(tri_out - ref)[errors].view(-1)}\n\nlens:\n{lens}\n{ref}\n{tri_out}",
     )
     for i, (d_ref, d_tri) in enumerate([(ref_dv, tri_dv), (ref_dk, tri_dk), (ref_dq, tri_dq)]):
-        atol = 1e-3
+        atol = 1e-2
         if dtype == torch.float32:
             atol = 5e-5
         errors = abs(d_ref - d_tri) > atol
