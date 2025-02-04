@@ -84,7 +84,7 @@ def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
     elif HEAD_DIM == 256:
         max_size = 128
         min_size = 32
-        max_pipeline = 1
+        max_pipeline = 2
         max_warps = 4
 
     configs = [i for i in configs if min_size <= i.kwargs['TILE_K_SIZE'] <= max_size]

@@ -19,15 +19,16 @@ if __name__ == "__main__":
     batches = (64,)
     configs = []
     params = (
+        # [
+        #     dict(
+        #         batch=batch,
+        #         dim=128,
+        #         heads=6,
+        #         name="dim-128",
+        #     )
+        #     for batch in batches
+        # ] +
         [
-            dict(
-                batch=batch,
-                dim=128,
-                heads=6,
-                name="dim-128",
-            )
-            for batch in batches
-        ] + [
             dict(
                 batch=batch,
                 dim=256,

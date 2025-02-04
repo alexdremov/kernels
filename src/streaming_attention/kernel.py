@@ -301,6 +301,9 @@ def _streaming_attn_fwd(
     softmax_scale: tl.constexpr = tl.cast(SM_SCALE * RCP_LN2, q_tile.dtype)
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
 
+    if PRESCALE_QK:
+        q_tile = q_tile * softmax_scale
+
     for kv_tile_idx in tl.range(
         kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
     ):
@@ -324,11 +327,8 @@ def _streaming_attn_fwd(
                 boundary_check=(0,),
             )
 
-        q_tile_scaled = q_tile
-        if PRESCALE_QK:
-            q_tile_scaled = q_tile * softmax_scale
         qk = tl.dot(
-            q_tile_scaled, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
+            q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
         )
 
         kv_indices = kv_token_idx + tile_k_arange
@@ -438,6 +438,7 @@ def _streaming_attn_fwd(
 @triton.heuristics(
     dict(
         BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_SIZE'] == 0,
+        RCP_LN2=lambda _: math.log2(math.e),
     )
 )
 @triton.jit
@@ -452,6 +453,7 @@ def _streaming_attn_bwd_precompute(
     DTYPE:  tl.constexpr,  #
     TILE_SIZE: tl.constexpr,
     BLOCK_DIVISIBLE: tl.constexpr,  #
+    RCP_LN2: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -540,6 +542,7 @@ def _streaming_attn_bwd(
     DTYPE: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
+    PRESCALE_QK: tl.constexpr,  #
     PERFECT_DKV_MATCHING: tl.constexpr,  #
     PERFECT_DQ_MATCHING: tl.constexpr,  #
     DQ_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
@@ -583,13 +586,14 @@ def _streaming_attn_bwd(
             CONTEXTS_BACK=CONTEXTS_BACK,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
+            PRESCALE_QK=PRESCALE_QK,
             PERFECT_DKV_MATCHING=PERFECT_DKV_MATCHING,
             DK_Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
             DK_K_BLOCK_DIVISIBLE=DK_K_BLOCK_DIVISIBLE,
             RCP_LN2=RCP_LN2,
             TILE_DK_Q_SIZE=TILE_DK_Q_SIZE,
             TILE_DK_K_SIZE=TILE_DK_K_SIZE,
-            PIPELINING=PIPELINING
+            PIPELINING=PIPELINING,
         )
     else:
         _streaming_attn_bwd_dq_inner(
@@ -612,6 +616,7 @@ def _streaming_attn_bwd(
             CONTEXTS_BACK=CONTEXTS_BACK,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
+            PRESCALE_QK=PRESCALE_QK,
             PERFECT_DQ_MATCHING=PERFECT_DQ_MATCHING,
             DQ_Q_BLOCK_DIVISIBLE=DQ_Q_BLOCK_DIVISIBLE,
             DQ_K_BLOCK_DIVISIBLE=DQ_K_BLOCK_DIVISIBLE,
@@ -643,6 +648,7 @@ def _streaming_attn_bwd_dq_inner(
     CONTEXTS_BACK: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
+    PRESCALE_QK: tl.constexpr,  #
     PERFECT_DQ_MATCHING: tl.constexpr,  #
     DQ_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     DQ_K_BLOCK_DIVISIBLE: tl.constexpr,  #
@@ -669,7 +675,7 @@ def _streaming_attn_bwd_dq_inner(
         base=LSE + lsebatch_head_offset,
         shape=(T,),
         strides=(stride_mt,),
-        offsets=(0,),
+        offsets=(q_token_idx,),
         block_shape=(TILE_DQ_Q_SIZE,),
         order=(0,),
     )
@@ -679,7 +685,7 @@ def _streaming_attn_bwd_dq_inner(
         base=DELTA + delta_tile_ptr,
         shape=(T,),
         strides=(stride_deltat,),
-        offsets=(0,),
+        offsets=(q_token_idx,),
         block_shape=(TILE_DQ_Q_SIZE,),
         order=(0,),
     )
@@ -741,6 +747,7 @@ def _streaming_attn_bwd_dq_inner(
         PERFECT_MATCHING=PERFECT_DQ_MATCHING,
         RCP_LN2=RCP_LN2,
         SM_SCALE=SM_SCALE,
+        PRESCALE_QK=PRESCALE_QK,
     )
 
     dqbatch_head_offset = batch * stride_dqb + head * stride_dqh
@@ -782,6 +789,7 @@ def _streaming_attn_bwd_dkdv_inner(
     CONTEXTS_BACK: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
+    PRESCALE_QK: tl.constexpr,  #
     PERFECT_DKV_MATCHING: tl.constexpr,  #
     DK_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     DK_K_BLOCK_DIVISIBLE: tl.constexpr,  #
@@ -889,6 +897,7 @@ def _streaming_attn_bwd_dkdv_inner(
         Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
         RCP_LN2=RCP_LN2,
         SM_SCALE=SM_SCALE,
+        PRESCALE_QK=PRESCALE_QK,
     )
 
     dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
@@ -937,6 +946,7 @@ def _streaming_attn_bwd_dq(
     K_BLOCK_DIVISIBLE: tl.constexpr,
     RCP_LN2: tl.constexpr,
     SM_SCALE: tl.constexpr,
+    PRESCALE_QK: tl.constexpr,
 ):
     q_tile_min_context = q_token_idx // CONTEXT_SIZE
     kv_start_tile_idx = max(
@@ -949,11 +959,17 @@ def _streaming_attn_bwd_dq(
         min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
     )
 
-    softmax_scale: tl.constexpr = tl.cast(SM_SCALE, q.dtype)
-
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+    if not PERFECT_MATCHING:
+        q_context_indices = q_tile_indices // CONTEXT_SIZE
+
     q_len_mask = q_tile_indices[:, None] < seq_len
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
+
+    softmax_scale: tl.constexpr = tl.cast(SM_SCALE, q.dtype)
+    if PRESCALE_QK:
+        q = q * softmax_scale * RCP_LN2
+
     for kv_tile_idx in tl.range(
         kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
     ):
@@ -975,23 +991,27 @@ def _streaming_attn_bwd_dq(
                 boundary_check=(1,),
             )
 
-        qk = tl.dot(q * softmax_scale, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        p = tl.math.exp2(qk / RCP_LN2 - m)
+        qk = tl.dot(q, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        if not PRESCALE_QK:
+            qk = qk * softmax_scale * RCP_LN2
+        p = tl.math.exp2(qk - m)
 
         kv_indices = kv_token_idx + tile_k_arange
         mask = q_len_mask & (
             kv_indices[None, :] < seq_len
         )
         if not PERFECT_MATCHING:
-            q_context_indices = q_tile_indices // CONTEXT_SIZE
             kv_context_indices = kv_indices // CONTEXT_SIZE
             blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
             streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
             mask &= streaming_mask
+
         p = tl.where(mask, p, 0.0)
-        dp = tl.dot(do, vT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        ds = p * (dp - di[:, None]) * softmax_scale
-        dq = tl.dot(ds.to(kT.dtype), tl.trans(kT), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        ds = p * (dp - di[:, None])
+        dq = tl.dot(ds, tl.trans(kT).to(ds.dtype), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+
+    dq *= softmax_scale
     return dq
 
 
@@ -1013,6 +1033,7 @@ def _streaming_attn_bwd_dkdv(
     Q_BLOCK_DIVISIBLE: tl.constexpr,
     RCP_LN2: tl.constexpr,
     SM_SCALE: tl.constexpr,
+    PRESCALE_QK: tl.constexpr,
 ):
     kv_tile_min_context = kv_token_idx // CONTEXT_SIZE
     q_start_tile_idx = (kv_tile_min_context * CONTEXT_SIZE) // TILE_Q_SIZE
@@ -1027,12 +1048,15 @@ def _streaming_attn_bwd_dkdv(
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
     kv_context_indices = kv_indices // CONTEXT_SIZE
 
-    softmax_scale: tl.constexpr = tl.cast(SM_SCALE / RCP_LN2, k.dtype)
+    softmax_scale: tl.constexpr = tl.cast(SM_SCALE, k.dtype)
     tile_q_arange = tl.arange(0, TILE_Q_SIZE)
 
     kv_lens_mask = (
         kv_indices[:, None] < seq_len
     )
+
+    if PRESCALE_QK:
+        k = k * RCP_LN2 * softmax_scale
 
     for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
@@ -1071,7 +1095,9 @@ def _streaming_attn_bwd_dkdv(
             )
         tl.static_assert(m.dtype == tl.float32)
 
-        qkT = tl.dot(k * softmax_scale, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        if not PRESCALE_QK:
+            qkT = qkT * RCP_LN2 * softmax_scale
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tile_q_arange
@@ -1089,11 +1115,13 @@ def _streaming_attn_bwd_dkdv(
         tl.static_assert(Di.dtype == tl.float32)
 
         # Compute dP and dS.
-        dpT = tl.dot(v, tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dpT = tl.dot(v.to(do.dtype), tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dk = tl.dot(dsT.to(qT.dtype), tl.trans(qT), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+    dk *= softmax_scale
     return dk, dv
 # fmt: on
+
 
 def autotune_prehook(kwargs, reset_only=False):
     if kwargs['L'] is not None:
@@ -1184,16 +1212,17 @@ streaming_backward_autotune = triton.autotune(
 
 @torch.library.custom_op("alexdremov_streaming_attention::forward", mutates_args=(), device_types=("cuda",))
 def attention_forward_adapter(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        lens: torch.Tensor,
-        context_size: int,
-        back_contexts: int,
-        sm_scale: float,
-        autotune: bool,
-        return_lse: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor,
+    context_size: int,
+    back_contexts: int,
+    sm_scale: float,
+    autotune: bool,
+    return_lse: bool,
+    prescale_qk: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
     assert back_contexts >= 0 and context_size >= 1
@@ -1208,7 +1237,7 @@ def attention_forward_adapter(
 
     INPUT_PRECISION = "ieee"
     if not torch.compiler.is_compiling():
-        INPUT_PRECISION = ("tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee")
+        INPUT_PRECISION = "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
 
     grid = lambda args: (
         batch,
@@ -1238,7 +1267,7 @@ def attention_forward_adapter(
         CONTEXT_SIZE=context_size,
         CONTEXTS_BACK=back_contexts,
         INPUT_PRECISION=INPUT_PRECISION,
-        PRESCALE_QK=True,
+        PRESCALE_QK=prescale_qk,
         DTYPE=q.dtype,
         TIME_BUCKET=triton.next_power_of_2(T),
         OUTPUT_LOGSUMEXP=(need_grad or return_lse),
@@ -1249,16 +1278,17 @@ def attention_forward_adapter(
 
 @torch.library.register_fake("alexdremov_streaming_attention::forward")
 def attention_forward_adapter_abstract(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        lens: torch.Tensor | None,
-        context_size: int,
-        back_contexts: int,
-        sm_scale: float | None,
-        autotune: bool,
-        return_lse: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor | None,
+    context_size: int,
+    back_contexts: int,
+    sm_scale: float | None,
+    autotune: bool,
+    return_lse: bool,
+    prescale_qk: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
         torch.empty(q.shape[:3], dtype=torch.float32, device=q.device),
@@ -1267,18 +1297,19 @@ def attention_forward_adapter_abstract(
 
 @torch.library.custom_op("alexdremov_streaming_attention::backward", mutates_args=(), device_types=("cuda",))
 def attention_backward_adapter(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        lens: torch.Tensor,
-        o: torch.Tensor,
-        lse: torch.Tensor,
-        do: torch.Tensor,
-        context_size: int,
-        back_contexts: int,
-        sm_scale: float,
-        autotune: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    do: torch.Tensor,
+    context_size: int,
+    back_contexts: int,
+    sm_scale: float,
+    autotune: bool,
+    prescale_qk: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
     delta = torch.empty(o.shape[:-1], dtype=torch.float32, device=o.device)
@@ -1306,8 +1337,7 @@ def attention_backward_adapter(
 
     INPUT_PRECISION = "ieee"
     if not torch.compiler.is_compiling():
-        INPUT_PRECISION = ("tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee")
-
+        INPUT_PRECISION = "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
 
     grid = lambda args: (
         batch,
@@ -1315,9 +1345,7 @@ def attention_backward_adapter(
         triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
     )
 
-    fwd_fn = (
-        streaming_backward_autotune if autotune else streaming_backward
-    )
+    fwd_fn = streaming_backward_autotune if autotune else streaming_backward
     fwd_fn[grid](
         q,
         k,
@@ -1347,6 +1375,7 @@ def attention_backward_adapter(
         INPUT_PRECISION=INPUT_PRECISION,
         DTYPE=q.dtype,
         SM_SCALE=sm_scale,
+        PRESCALE_QK=prescale_qk,
     )
 
     return DQ, DK, DV
@@ -1354,18 +1383,19 @@ def attention_backward_adapter(
 
 @torch.library.register_fake("alexdremov_streaming_attention::backward")
 def attention_backward_adapter_abstract(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        lens: torch.Tensor | None,
-        o: torch.Tensor,
-        lse: torch.Tensor,
-        do: torch.Tensor,
-        context_size: int,
-        back_contexts: int,
-        sm_scale: float | None,
-        autotune: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor | None,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    do: torch.Tensor,
+    context_size: int,
+    back_contexts: int,
+    sm_scale: float | None,
+    autotune: bool,
+    prescale_qk: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
     DV = torch.empty_like(v, memory_format=torch.contiguous_format)
@@ -1374,17 +1404,7 @@ def attention_backward_adapter_abstract(
 
 def attention_backward_adapter_op_setup_context(ctx, inputs, output):
     O, LSE = output
-    (
-        q,
-        k,
-        v,
-        lens,
-        context_size,
-        back_contexts,
-        sm_scale,
-        autotune,
-        return_lse
-    )= inputs
+    (q, k, v, lens, context_size, back_contexts, sm_scale, autotune, return_lse, prescale_qk) = inputs
     ctx.save_for_backward(
         q,
         k,
@@ -1397,6 +1417,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
     ctx.back_contexts = back_contexts
     ctx.autotune = autotune
     ctx.sm_scale = sm_scale
+    ctx.prescale_qk = prescale_qk
 
 
 def attention_backward_adapter_op(ctx, do, *grads):
@@ -1405,6 +1426,7 @@ def attention_backward_adapter_op(ctx, do, *grads):
     back_contexts = ctx.back_contexts
     autotune = ctx.autotune
     sm_scale = ctx.sm_scale
+    prescale_qk = ctx.prescale_qk
     batch, heads, T, HEAD_DIM = q.shape
 
     DQ, DK, DV = torch.ops.alexdremov_streaming_attention.backward(
@@ -1419,19 +1441,20 @@ def attention_backward_adapter_op(ctx, do, *grads):
         back_contexts=back_contexts,
         sm_scale=sm_scale,
         autotune=autotune,
+        prescale_qk=prescale_qk,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
     "alexdremov_streaming_attention::forward",
     attention_backward_adapter_op,
-    setup_context=attention_backward_adapter_op_setup_context
+    setup_context=attention_backward_adapter_op_setup_context,
 )
 
 
-def streaming_attention_reference(q, k, v, context_size, back_contexts, lens):
+def streaming_attention_reference(q, k, v, context_size, back_contexts, lens, scale=None):
     block_size = context_size
     left_context_blocks_count = back_contexts + 1
     T = q.shape[-2]
@@ -1452,7 +1475,7 @@ def streaming_attention_reference(q, k, v, context_size, back_contexts, lens):
 
     sparsity_fraction = attn_mask.sum().item() / attn_mask.numel()
     return (
-        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask) * res_mask,
+        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask, scale=scale),
         res_mask,
         sparsity_fraction,
     )
@@ -1469,6 +1492,7 @@ def _streaming_attention(
     sm_scale: float | None,
     autotune: bool,
     return_lse: bool,
+    prescale_qk: bool,
 ):
     O, LSE = torch.ops.alexdremov_streaming_attention.forward(
         q,
@@ -1480,6 +1504,7 @@ def _streaming_attention(
         sm_scale,
         autotune,
         return_lse,
+        prescale_qk,
     )
     if return_lse:
         return O, LSE
@@ -1496,6 +1521,7 @@ def streaming_attention(
     sm_scale: float | None = None,
     autotune=True,
     return_lse=False,
+    prescale_qk=False,
 ):
     """
     Computes block-sparse self-attention with chunked attention mask.
@@ -1515,6 +1541,7 @@ def streaming_attention(
         back_contexts (int): Number of contexts to look back
         sm_scale (float): Softmax scale, head_dim ** -0.5 by default
         autotune (bool): Use triton autotune for optimal kernel configuration
+        prescale_qk (bool): Prescale Q in QK^T calculations — slightly faster if True, slightly lower precision
     """
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
@@ -1522,7 +1549,7 @@ def streaming_attention(
             torch._dynamo.mark_static(i, 3)
     if sm_scale is None:
         HEAD_DIM = q.size(-1)
-        sm_scale = HEAD_DIM ** -0.5
+        sm_scale = HEAD_DIM**-0.5
     return _streaming_attention(
         q=q,
         k=k,
@@ -1533,6 +1560,7 @@ def streaming_attention(
         sm_scale=sm_scale,
         autotune=autotune,
         return_lse=return_lse,
+        prescale_qk=prescale_qk,
     )
 
 
