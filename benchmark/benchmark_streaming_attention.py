@@ -8,10 +8,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-sys.path.insert(
-    0,
-    f"{os.path.dirname(os.path.realpath(__file__))}/../src"
-)
+sys.path.insert(0, f"{os.path.dirname(os.path.realpath(__file__))}/../src")
 
 
 from torch.nn.attention.flex_attention import \
@@ -80,10 +77,11 @@ if __name__ == "__main__":
             for batch in batches
         ]
     )
-    for mode in ('bwd', 'fwd'):
+    for mode in ("bwd", "fwd"):
         for param in params:
             line_vals = [
                 f"triton-{mode}",
+                f"triton-{mode}-prescale",
                 f"flex-compile-{mode}",
                 f"torch-{mode}",
             ]
@@ -98,7 +96,6 @@ if __name__ == "__main__":
             x_vals = np.unique(x_vals)
             x_vals = sorted(x_vals)
 
-
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["time"],
@@ -106,7 +103,12 @@ if __name__ == "__main__":
                     line_arg="provider",
                     line_vals=line_vals,
                     line_names=line_vals,
-                    styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("yellow", "-")],
+                    styles=[
+                        ("red", "-"),
+                        ("blue", "-"),
+                        ("green", "-"),
+                        ("yellow", "-"),
+                    ],
                     ylabel="TFLOPS",
                     plot_name=f"streaming-attention-{mode}-{param['name']}-context-{context_size}-back-{back_context}-dim-{dim}-heads-{heads}-batch-{batch}",
                     args=dict(
@@ -128,20 +130,34 @@ if __name__ == "__main__":
 
         torch.set_float32_matmul_precision("highest")
 
-        q = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
-            mean=0.0, std=0.01
-        ).requires_grad_()
-        k = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
-            mean=0.0, std=0.01
-        ).requires_grad_()
-        v = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
-            mean=0.0, std=0.01
-        ).requires_grad_()
+        q = (
+            torch.randn((batch, heads, time, dim), dtype=dtype, device=device)
+            .normal_(mean=0.0, std=0.01)
+            .requires_grad_()
+        )
+        k = (
+            torch.randn((batch, heads, time, dim), dtype=dtype, device=device)
+            .normal_(mean=0.0, std=0.01)
+            .requires_grad_()
+        )
+        v = (
+            torch.randn((batch, heads, time, dim), dtype=dtype, device=device)
+            .normal_(mean=0.0, std=0.01)
+            .requires_grad_()
+        )
 
         lens = None
 
         if "triton" in provider:
-            fn = lambda: streaming_attention(q, k, v, lens, context_size, back_contexts)
+            fn = lambda: streaming_attention(
+                q=q,
+                k=k,
+                v=v,
+                lens=lens,
+                context_size=context_size,
+                back_contexts=back_contexts,
+                prescale_qk="prescale" in provider,
+            )
         elif "torch" in provider:
             block_size = context_size
             left_context_blocks_count = back_contexts + 1
@@ -195,7 +211,7 @@ if __name__ == "__main__":
                 Q_LEN=q.shape[2],
                 KV_LEN=k.shape[2],
                 BLOCK_SIZE=sparse_block_size,  # this is crucial to have full blocks
-                _compile="compile" in provider
+                _compile="compile" in provider,
             )
 
             if "compile" in provider:
@@ -205,10 +221,11 @@ if __name__ == "__main__":
             else:
                 fn = lambda: flex_attention(q, k, v, block_mask=block_mask)
 
-        if 'bwd' in provider:
-            do = torch.randn((batch, heads, time, dim), dtype=torch.float32, device=device).normal_(
-                mean=0.0, std=0.01
-            )
+        if "bwd" in provider:
+            do = torch.randn(
+                (batch, heads, time, dim), dtype=torch.float32, device=device
+            ).normal_(mean=0.0, std=0.01)
+
             def fn_back(fn):
                 res = fn()
                 res.backward(do)
@@ -222,7 +239,7 @@ if __name__ == "__main__":
         ref, res_mask = ref.cuda(), res_mask.cuda()
 
         print(f"Starting {provider}")
-        if 'bwd' in provider:
+        if "bwd" in provider:
             ref.backward(do)
             dq_ref, dk_ref, dv_ref = q.grad.clone(), k.grad.clone(), v.grad.clone()
             q.grad, k.grad, v.grad = [None] * 3
@@ -243,36 +260,41 @@ if __name__ == "__main__":
             msg=lambda x: f"error in {provider}\n{x}",
         )
 
-        if 'bwd' in provider and 'triton' in provider:
-            for i, (d_ref, d_tri) in enumerate([(dq_ref, dq), (dk_ref, dk), (dv_ref, dv)]):
+        if "bwd" in provider and "triton" in provider:
+            for i, (d_ref, d_tri) in enumerate(
+                [(dq_ref, dq), (dk_ref, dk), (dv_ref, dv)]
+            ):
                 atol = 1e-3
                 errors = abs(d_ref - d_tri) > atol
                 b_mismatch = torch.argmax(errors.sum((1, 2, 3)).view(-1)).item()
-                h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()
+                h_mismatch = torch.argmax(
+                    errors[b_mismatch].sum((1, 2)).view(-1)
+                ).item()
 
                 mask = res_mask.broadcast_to(d_ref.shape)
-                mean_err = (abs(d_ref[mask].to(torch.float32) - d_tri[mask].to(torch.float32)).mean() * 1000).item()
+                mean_err = (
+                    abs(
+                        d_ref[mask].to(torch.float32) - d_tri[mask].to(torch.float32)
+                    ).mean()
+                    * 1000
+                ).item()
 
                 torch.testing.assert_close(
                     d_tri,
                     d_ref,
                     atol=atol,
                     rtol=0,
-                    msg=lambda x: f"error in d{'qkv'[i]}\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(d_tri - d_ref)[errors].view(-1)}\n\nlens:\n{lens}\n{mean_err = }"
+                    msg=lambda x: f"error in d{'qkv'[i]}\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(d_tri - d_ref)[errors].view(-1)}\n\nlens:\n{lens}\n{mean_err = }",
                 )
 
-        with torch.inference_mode() if 'fwd' in provider else contextlib.nullcontext():
+        with torch.inference_mode() if "fwd" in provider else contextlib.nullcontext():
             ms = triton.testing.do_bench(
-                fn,
-                warmup=500,
-                rep=1000,
-                return_mode="mean",
-                grad_to_none=(q, k, v)
+                fn, warmup=500, rep=1000, return_mode="mean", grad_to_none=(q, k, v)
             )
 
         context_tok_size = context_size * (1 + back_contexts)
         total_flops = 4 * time * context_tok_size * heads * dim * batch
-        if 'bwd' in provider:
+        if "bwd" in provider:
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
         return (total_flops / (ms / 1000)) / 1e12
 

@@ -1,18 +1,15 @@
-import pytest
-import os
 import functools
+import os
 
-import torch
 import numpy as np
+import pytest
+import torch
 import torch.nn.functional as F
-
 import triton
+from torch.nn.attention.flex_attention import \
+    _round_up_to_multiple as round_up_to_multiple
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from torch.nn.attention.flex_attention import (
-    flex_attention,
-    create_block_mask,
-    _round_up_to_multiple as round_up_to_multiple,
-)
 
 def _get_reference(q, k, v, context_size, back_contexts, lens):
     block_size = context_size
@@ -76,18 +73,18 @@ if __name__ == "__main__":
             dim=128,
             heads=6,
         )
-        for batch in (32, )
+        for batch in (32,)
     ]
     for param in params:
         line_vals = [
             "flex-compile-fp16",
             "torch-compile-fp16",
         ]
-        context_size = param['context_size']
-        back_context = param['back_context']
-        dim = param['dim']
-        heads = param['heads']
-        batch = param['batch']
+        context_size = param["context_size"]
+        back_context = param["back_context"]
+        dim = param["dim"]
+        heads = param["heads"]
+        batch = param["batch"]
 
         x_vals = np.linspace(1, 2048, 16).astype(int).tolist()
         x_vals = np.unique(x_vals)
@@ -188,7 +185,9 @@ if __name__ == "__main__":
             else:
                 fn = lambda: flex_attention(q, k, v, block_mask=block_mask)
 
-        ref, res_mask, sparsity_fraction = _get_reference(q, k, v, context_size, back_contexts, lens)
+        ref, res_mask, sparsity_fraction = _get_reference(
+            q, k, v, context_size, back_contexts, lens
+        )
         ref, res_mask = ref.cuda(), res_mask.cuda()
 
         print(f"Starting {provider}")
@@ -205,6 +204,8 @@ if __name__ == "__main__":
         )
 
         with torch.inference_mode():
-            return triton.testing.do_bench(fn, warmup=1000, rep=500, return_mode='median')
+            return triton.testing.do_bench(
+                fn, warmup=1000, rep=500, return_mode="median"
+            )
 
     bench_streaming_attention.run(save_path=".", print_data=True)

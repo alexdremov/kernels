@@ -1,18 +1,18 @@
 import torch
-
 import triton
 import triton.language as tl
 from triton.tools.disasm import get_sass
 
 
 @triton.jit
-def add_kernel(x_ptr,  # *Pointer* to first input vector.
-               y_ptr,  # *Pointer* to second input vector.
-               output_ptr,  # *Pointer* to output vector.
-               n_elements,  # Size of the vector.
-               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
-               # NOTE: `constexpr` so it can be used as a shape value.
-               ):
+def add_kernel(
+    x_ptr,  # *Pointer* to first input vector.
+    y_ptr,  # *Pointer* to second input vector.
+    output_ptr,  # *Pointer* to output vector.
+    n_elements,  # Size of the vector.
+    BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
+    # NOTE: `constexpr` so it can be used as a shape value.
+):
     # There are multiple 'programs' processing different data. We identify which program
     # we are here:
     pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
@@ -35,12 +35,12 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
 
 if __name__ == "__main__":
     size = 1024
-    x = torch.rand(size, device='cuda')
-    y = torch.rand(size, device='cuda')
-    grid = lambda meta: (triton.cdiv(size, meta['BLOCK_SIZE']),)
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    grid = lambda meta: (triton.cdiv(size, meta["BLOCK_SIZE"]),)
 
     output = torch.empty_like(x)
     compiled_kernel = add_kernel[grid](x, y, output, size, BLOCK_SIZE=1024)
 
     # to get all the codegen keys
-    print(compiled_kernel.asm['ttir'])
+    print(compiled_kernel.asm["ttir"])

@@ -109,9 +109,11 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
         max_pipeline = 1
         max_warps = 4
 
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_K_SIZE'] <= max_size]
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_Q_SIZE'] <= max_size]
-    configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_K_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_Q_SIZE"] <= max_size]
+    configs = [
+        i for i in configs if min_pipeline <= i.kwargs["PIPELINING"] <= max_pipeline
+    ]
     configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
 
     default_config = _get_default_config_fwd(HEAD_DIM, DTYPE)
@@ -157,11 +159,13 @@ def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
         min_pipeline = 2
         max_warps = 4
 
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_DQ_Q_SIZE'] <= max_size]
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_DQ_K_SIZE'] <= max_size]
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_DK_Q_SIZE'] <= max_size]
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_DK_K_SIZE'] <= max_size]
-    configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DQ_Q_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DQ_K_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DK_Q_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DK_K_SIZE"] <= max_size]
+    configs = [
+        i for i in configs if min_pipeline <= i.kwargs["PIPELINING"] <= max_pipeline
+    ]
     configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
 
     default_config = _get_default_config_bwd(HEAD_DIM, DTYPE)
@@ -1123,20 +1127,24 @@ def _streaming_attn_bwd_dkdv(
 
 
 def autotune_prehook(kwargs, reset_only=False):
-    if kwargs['L'] is not None:
-        kwargs['L'].add_(kwargs['q'].size(2))  # L += time
+    if kwargs["L"] is not None:
+        kwargs["L"].add_(kwargs["q"].size(2))  # L += time
 
 
 def autotune_posthook(kwargs, exception=None):
-    if kwargs['L'] is not None:
-        kwargs['L'].add_(-kwargs['q'].size(2))  # L -= time
+    if kwargs["L"] is not None:
+        kwargs["L"].add_(-kwargs["q"].size(2))  # L -= time
 
 
 streaming_forward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
-        TILE_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-        TILE_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+        TILE_Q_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+        ),
+        TILE_K_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+        ),
     )
 )(_streaming_attn_fwd)
 streaming_forward_autotune = triton.autotune(
@@ -1153,13 +1161,28 @@ streaming_forward_autotune = triton.autotune(
         for num_warps in [4, 8]
         for pipe in [1, 2]
         for tile_q in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
         for tile_k in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
     ],
-    key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "TIME_BUCKET", "DTYPE"],
+    key=[
+        "HEAD_DIM",
+        "CONTEXT_SIZE",
+        "CONTEXTS_BACK",
+        "INPUT_PRECISION",
+        "TIME_BUCKET",
+        "DTYPE",
+    ],
     prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
@@ -1168,10 +1191,18 @@ streaming_forward_autotune = triton.autotune(
 streaming_backward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
-        TILE_DQ_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-        TILE_DQ_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-        TILE_DK_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
-        TILE_DK_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, triton.next_power_of_2(args['CONTEXT_SIZE']))),
+        TILE_DQ_Q_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+        ),
+        TILE_DQ_K_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+        ),
+        TILE_DK_Q_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+        ),
+        TILE_DK_K_SIZE=lambda args: min(
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+        ),
     )
 )(_streaming_attn_bwd)
 streaming_backward_autotune = triton.autotune(
@@ -1190,26 +1221,51 @@ streaming_backward_autotune = triton.autotune(
         for num_warps in [4, 8]
         for pipe in [1, 2, 3]
         for tile_qq in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
         for tile_qk in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
         for tile_kq in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
         for tile_kk in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
     ],
-    key=["HEAD_DIM", "CONTEXT_SIZE", "CONTEXTS_BACK", "INPUT_PRECISION", "DTYPE", "TIME_BUCKET"],
+    key=[
+        "HEAD_DIM",
+        "CONTEXT_SIZE",
+        "CONTEXTS_BACK",
+        "INPUT_PRECISION",
+        "DTYPE",
+        "TIME_BUCKET",
+    ],
     prune_configs_by=dict(early_config_prune=bwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
 )(_streaming_attn_bwd)
 
 
-@torch.library.custom_op("alexdremov_streaming_attention::forward", mutates_args=(), device_types=("cuda",))
+@torch.library.custom_op(
+    "alexdremov_streaming_attention::forward", mutates_args=(), device_types=("cuda",)
+)
 def attention_forward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1229,14 +1285,18 @@ def attention_forward_adapter(
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
     assert T == k.shape[-2] and T == v.shape[-2]
     assert sm_scale is not None
-    assert lens is None or (lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1)
+    assert lens is None or (
+        lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1
+    )
 
     O = torch.zeros_like(q, memory_format=torch.contiguous_format)
     LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
 
     INPUT_PRECISION = "ieee"
     if not torch.compiler.is_compiling():
-        INPUT_PRECISION = "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
+        INPUT_PRECISION = (
+            "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
+        )
 
     grid = lambda args: (
         batch,
@@ -1294,7 +1354,9 @@ def attention_forward_adapter_abstract(
     )
 
 
-@torch.library.custom_op("alexdremov_streaming_attention::backward", mutates_args=(), device_types=("cuda",))
+@torch.library.custom_op(
+    "alexdremov_streaming_attention::backward", mutates_args=(), device_types=("cuda",)
+)
 def attention_backward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1336,7 +1398,9 @@ def attention_backward_adapter(
 
     INPUT_PRECISION = "ieee"
     if not torch.compiler.is_compiling():
-        INPUT_PRECISION = "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
+        INPUT_PRECISION = (
+            "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
+        )
 
     grid = lambda args: (
         batch,
@@ -1403,7 +1467,18 @@ def attention_backward_adapter_abstract(
 
 def attention_backward_adapter_op_setup_context(ctx, inputs, output):
     O, LSE = output
-    (q, k, v, lens, context_size, back_contexts, sm_scale, autotune, return_lse, prescale_qk) = inputs
+    (
+        q,
+        k,
+        v,
+        lens,
+        context_size,
+        back_contexts,
+        sm_scale,
+        autotune,
+        return_lse,
+        prescale_qk,
+    ) = inputs
     ctx.save_for_backward(
         q,
         k,
@@ -1453,7 +1528,9 @@ torch.library.register_autograd(
 )
 
 
-def streaming_attention_reference(q, k, v, context_size, back_contexts, lens, scale=None):
+def streaming_attention_reference(
+    q, k, v, context_size, back_contexts, lens, scale=None
+):
     block_size = context_size
     left_context_blocks_count = back_contexts + 1
     T = q.shape[-2]
@@ -1464,7 +1541,9 @@ def streaming_attention_reference(q, k, v, context_size, back_contexts, lens, sc
     attn_mask = attn_mask.cuda()
 
     if lens is not None:
-        key_padding_mask = (torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)).unsqueeze(-1)
+        key_padding_mask = (
+            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+        ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
         attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.unsqueeze(1)
@@ -1474,7 +1553,9 @@ def streaming_attention_reference(q, k, v, context_size, back_contexts, lens, sc
 
     sparsity_fraction = attn_mask.sum().item() / attn_mask.numel()
     return (
-        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask, scale=scale),
+        F.scaled_dot_product_attention(
+            query=q, key=k, value=v, attn_mask=attn_mask, scale=scale
+        ),
         res_mask,
         sparsity_fraction,
     )
@@ -1582,7 +1663,7 @@ if __name__ == "__main__":
         context_size=context,
         back_contexts=back,
         dtype=torch.float32,
-        lens='none',
+        lens="none",
         noncontiguous=False,
         autotune=False,
     )

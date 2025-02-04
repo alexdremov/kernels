@@ -6,38 +6,33 @@ import torch
 import torch.nn.functional as F
 import triton
 
-sys.path.insert(
-    0,
-    f"{os.path.dirname(os.path.realpath(__file__))}/../src"
-)
+sys.path.insert(0, f"{os.path.dirname(os.path.realpath(__file__))}/../src")
 
-from self_attention import (self_attention,
-                            self_attention_reference,
+from self_attention import (self_attention, self_attention_reference,
                             self_attention_reference_naive)
 
 if __name__ == "__main__":
     batches = (64,)
     configs = []
-    params = (
-        # [
-        #     dict(
-        #         batch=batch,
-        #         dim=128,
-        #         heads=6,
-        #         name="dim-128",
-        #     )
-        #     for batch in batches
-        # ] +
-        [
-            dict(
-                batch=batch,
-                dim=256,
-                heads=6,
-                name="dim-256",
-            )
-            for batch in batches
-        ]
-    )
+    params = [
+        dict(
+            batch=batch,
+            dim=64,
+            heads=6,
+            name="dim-64-prescale",
+            prescale=True,
+        )
+        for batch in batches
+    ] + [
+        dict(
+            batch=batch,
+            dim=64,
+            heads=6,
+            name="dim-64-noprescale",
+            prescale=False,
+        )
+        for batch in batches
+    ]
     for param in params:
         line_vals = [
             f"triton",
@@ -47,6 +42,7 @@ if __name__ == "__main__":
         dim = param["dim"]
         heads = param["heads"]
         batch = param["batch"]
+        prescale = param["prescale"]
 
         x_vals = np.linspace(257, 8000, 6).astype(int).tolist()
         x_vals = np.unique(x_vals)
@@ -60,44 +56,53 @@ if __name__ == "__main__":
                 line_vals=line_vals,
                 line_names=line_vals,
                 styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("yellow", "-")],
-                ylabel="ms",
-                plot_name=f"self-attention-{param['name']}-dim-{dim}-heads-{heads}-batch-{batch}",
+                ylabel="TFLOPS",
+                plot_name=f"self-attention-{param['name']}-dim-{dim}-heads-{heads}-batch-{batch}-prescale-{prescale}",
                 args=dict(
                     batch=batch,
                     heads=heads,
                     dim=dim,
                     dtype=torch.float16,
+                    prescale=prescale,
                 ),
             )
         )
 
     @triton.testing.perf_report(configs)
     def bench_self_attention(
-        provider, time, batch, heads, dim, dtype,
+        provider,
+        time,
+        batch,
+        heads,
+        dim,
+        dtype,
+        prescale,
     ):
         device = "cuda"
 
         torch.set_float32_matmul_precision("highest")
 
         q = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
-            mean=0.0, std=0.01
+            mean=0.0, std=1
         )
         k = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
-            mean=0.0, std=0.01
+            mean=0.0, std=1
         )
         v = torch.randn((batch, heads, time, dim), dtype=dtype, device=device).normal_(
-            mean=0.0, std=0.01
+            mean=0.0, std=1
         )
 
         lens = None
         if "triton" in provider:
-            fn = lambda: self_attention(q, k, v, lens)
+            fn = lambda: self_attention(q, k, v, lens, prescale=prescale)
         elif "torch-sdpa" in provider:
+
             def torch_test():
                 return self_attention_reference(q, k, v, lens)[0]
 
             fn = torch_test
         elif "torch-naive" in provider:
+
             def torch_test():
                 return self_attention_reference_naive(q, k, v, lens)[0]
 
@@ -105,9 +110,7 @@ if __name__ == "__main__":
         else:
             assert False
 
-        ref, res_mask = self_attention_reference(
-            q, k, v, lens
-        )
+        ref, res_mask = self_attention_reference(q, k, v, lens)
         ref, res_mask = ref.cuda(), res_mask.cuda()
 
         print(f"Starting {provider}")
@@ -119,7 +122,7 @@ if __name__ == "__main__":
 
         actual = actual * res_mask.broadcast_to(actual.shape)
 
-        atol = 3e-3
+        atol = 5e-3
         torch.testing.assert_close(
             actual,
             ref,
@@ -139,7 +142,6 @@ if __name__ == "__main__":
             except torch.OutOfMemoryError:
                 return 0
 
-        return ms
         total_flops = 4 * time * time * heads * dim * batch
         return (total_flops / (ms / 1000)) / 1e12
 

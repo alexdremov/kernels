@@ -4,11 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from self_attention import (
-    self_attention,
-    self_attention_reference,
-    self_attention_reference_naive
-)
+from self_attention import (self_attention, self_attention_reference,
+                            self_attention_reference_naive)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=lambda x: f"{x}")
@@ -22,9 +19,7 @@ from self_attention import (
 @pytest.mark.parametrize("B", [1, 40, 64], ids=lambda x: f"batch-{x}")
 @pytest.mark.parametrize("H", [1, 6, 8], ids=lambda x: f"heads-{x}")
 @pytest.mark.parametrize("T", [1, 10, 16, 800, 1025], ids=lambda x: f"time-{x}")
-@pytest.mark.parametrize(
-    "autotune", [False, True], ids=lambda x: f"autotune-{x}"
-)
+@pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
 def test_self_attention(
     B,
     H,
@@ -45,11 +40,7 @@ def test_self_attention(
         pytest.skip("skipping bf16 in interpreter mode")
 
     if autotune and not (
-        T in {16, 800} and
-        H == 1 and
-        B == 67 and
-        noncontiguous and
-        lens == 'tricky'
+        T in {16, 800} and H == 1 and B == 67 and noncontiguous and lens == "tricky"
     ):
         pytest.skip("reduced tests for autotune")
 
@@ -63,7 +54,7 @@ def test_self_attention(
             requires_grad=True,
             noncontiguous=noncontiguous,
             low=-0.1,
-            high=0.1
+            high=0.1,
         )
         for _ in range(3)
     ]
@@ -91,9 +82,7 @@ def test_self_attention(
     else:
         lens = torch.randint(1, T + 1, (B,), dtype=torch.int32, device="cuda")
 
-    ref, res_mask = self_attention_reference(
-        q, k, v, lens
-    )
+    ref, res_mask = self_attention_reference(q, k, v, lens)
     tri_out = self_attention(q, k, v, lens, autotune=autotune)
 
     # torch.set_printoptions(linewidth=400, profile="full")

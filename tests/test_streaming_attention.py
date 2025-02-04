@@ -5,24 +5,33 @@ import pytest
 import torch
 
 from streaming_attention import (streaming_attention,
-                                 streaming_attention_reference,)
+                                 streaming_attention_reference)
 
 
-
-
-@pytest.mark.parametrize("lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}")
-@pytest.mark.parametrize("noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}")
+@pytest.mark.parametrize(
+    "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
+)
+@pytest.mark.parametrize(
+    "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
+)
 @pytest.mark.parametrize("do_fp32", [False], ids=lambda x: f"do_fp32-{x}")
 @pytest.mark.parametrize("qkv_same", [False], ids=lambda x: f"qkv_same-{x}")
-@pytest.mark.parametrize("context_size", [1, 10, 16, 32, 10000], ids=lambda x: f"context-{x}")
-@pytest.mark.parametrize("back_contexts", [0, 5, 10000], ids=lambda x: f"back_contexts-{x}")
+@pytest.mark.parametrize(
+    "context_size", [1, 10, 16, 32, 10000], ids=lambda x: f"context-{x}"
+)
+@pytest.mark.parametrize(
+    "back_contexts", [0, 5, 10000], ids=lambda x: f"back_contexts-{x}"
+)
 @pytest.mark.parametrize("HEAD_DIM", [16, 64], ids=lambda x: f"dim-{x}")
 @pytest.mark.parametrize("B", [1, 40], ids=lambda x: f"batch-{x}")
 @pytest.mark.parametrize("H", [1, 6], ids=lambda x: f"heads-{x}")
 @pytest.mark.parametrize("T", [1, 10, 16, 800], ids=lambda x: f"time-{x}")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=lambda x: f"{x}")
 @pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
-@pytest.mark.skipif(torch.cuda.get_device_capability() < (8, 0), reason="requires Ampere and higher")
+@pytest.mark.parametrize("prescale", [False, True], ids=lambda x: f"prescale-{x}")
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() < (8, 0), reason="requires Ampere and higher"
+)
 def test_streaming_attention_reference(
     B,
     H,
@@ -36,6 +45,7 @@ def test_streaming_attention_reference(
     autotune,
     do_fp32,
     qkv_same,
+    prescale,
 ):
     torch._dynamo.reset()
 
@@ -54,8 +64,9 @@ def test_streaming_attention_reference(
         and H == 1
         and B == 67
         and noncontiguous
-        and lens == 'tricky'
+        and lens == "tricky"
         and not qkv_same
+        and prescale
     ):
         pytest.skip("reduced tests for autotune")
         return
@@ -119,7 +130,9 @@ def test_streaming_attention_reference(
             max(T // 2, 1),
             max(T // 4, 1),
         ]
-        lens = torch.tensor(np.random.choice(tricky_lens, B), dtype=torch.int32, device="cuda")
+        lens = torch.tensor(
+            np.random.choice(tricky_lens, B), dtype=torch.int32, device="cuda"
+        )
     else:
         lens = torch.randint(1, T + 1, (B,), dtype=torch.int32, device="cuda")
 
@@ -136,7 +149,9 @@ def test_streaming_attention_reference(
         lens_tmp[:] = lens
         lens = lens_tmp
 
-    ref, res_mask, _ = streaming_attention_reference(q.float(), k.float(), v.float(), context_size, back_contexts, lens)
+    ref, res_mask, _ = streaming_attention_reference(
+        q.float(), k.float(), v.float(), context_size, back_contexts, lens
+    )
     dout = dout * res_mask.broadcast_to(dout.shape)
     ref.backward(dout.float())
     ref = ref.to(q.dtype)
@@ -145,7 +160,16 @@ def test_streaming_attention_reference(
     ref_dk, k.grad = k.grad.clone(), None
     ref_dq, q.grad = q.grad.clone(), None
 
-    tri_out = streaming_attention(q, k, v, lens, context_size, back_contexts, autotune=autotune)
+    tri_out = streaming_attention(
+        q,
+        k,
+        v,
+        lens,
+        context_size,
+        back_contexts,
+        autotune=autotune,
+        prescale_qk=prescale,
+    )
     tri_out.backward(dout)
 
     tri_dv, v.grad = v.grad.clone(), None
@@ -170,7 +194,9 @@ def test_streaming_attention_reference(
         rtol=0,
         msg=lambda x: f"forward error\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(tri_out - ref)[errors].view(-1)}\n\nlens:\n{lens}\n{ref}\n{tri_out}",
     )
-    for i, (d_ref, d_tri) in enumerate([(ref_dv, tri_dv), (ref_dk, tri_dk), (ref_dq, tri_dq)]):
+    for i, (d_ref, d_tri) in enumerate(
+        [(ref_dv, tri_dv), (ref_dk, tri_dk), (ref_dq, tri_dq)]
+    ):
         atol = 1e-2
         if dtype == torch.float32:
             atol = 5e-5
@@ -179,7 +205,10 @@ def test_streaming_attention_reference(
         h_mismatch = torch.argmax(errors[b_mismatch].sum((1, 2)).view(-1)).item()
 
         mask = res_mask.broadcast_to(tri_out.shape)
-        mean_err = (abs(d_ref[mask].to(torch.float32) - d_tri[mask].to(torch.float32)).mean() * 1000).item()
+        mean_err = (
+            abs(d_ref[mask].to(torch.float32) - d_tri[mask].to(torch.float32)).mean()
+            * 1000
+        ).item()
 
         torch.testing.assert_close(
             d_tri,
@@ -190,14 +219,16 @@ def test_streaming_attention_reference(
         )
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability() < (8, 0), reason="requires Ampere and higher")
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() < (8, 0), reason="requires Ampere and higher"
+)
 @pytest.mark.parametrize("lens_mode", ["none", "random"], ids=lambda x: f"lens-{x}")
 def test_streaming_attention_dynamic(lens_mode):
     torch._dynamo.reset()
-    torch._dynamo.utils.counters['stats'].clear()
+    torch._dynamo.utils.counters["stats"].clear()
 
     # https://github.com/pytorch/pytorch/issues/124565#issuecomment-2070891266
-    torch.empty(1, device='cuda', requires_grad=True).backward()
+    torch.empty(1, device="cuda", requires_grad=True).backward()
 
     H, HEAD_DIM = (
         4,
@@ -221,8 +252,10 @@ def test_streaming_attention_dynamic(lens_mode):
             if lens_mode == "random":
                 lens = torch.randint(1, T + 1, (B,), dtype=torch.int32, device=q.device)
 
-            tri_out = streaming_attention(q, k, v, lens, context_size=16, back_contexts=2, autotune=False)
+            tri_out = streaming_attention(
+                q, k, v, lens, context_size=16, back_contexts=2, autotune=False
+            )
             dout = torch.randn_like(tri_out, device=q.device)
             tri_out.backward(dout)
 
-            assert torch._dynamo.utils.counters['stats']['unique_graphs'] <= 4
+            assert torch._dynamo.utils.counters["stats"]["unique_graphs"] <= 4

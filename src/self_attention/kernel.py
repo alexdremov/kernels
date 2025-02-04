@@ -87,9 +87,11 @@ def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
         max_pipeline = 2
         max_warps = 4
 
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_K_SIZE'] <= max_size]
-    configs = [i for i in configs if min_size <= i.kwargs['TILE_Q_SIZE'] <= max_size]
-    configs = [i for i in configs if min_pipeline <= i.kwargs['PIPELINING'] <= max_pipeline]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_K_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_Q_SIZE"] <= max_size]
+    configs = [
+        i for i in configs if min_pipeline <= i.kwargs["PIPELINING"] <= max_pipeline
+    ]
     configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
 
     default_config = _get_default_config_fwd(HEAD_DIM, DTYPE)
@@ -129,6 +131,7 @@ def _self_attn_fwd(
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
     lens_stride: int,
     T: int,  #
+    PRESCALE: tl.constexpr,  #
     TIME_BUCKET:  int,  #
     LEN_PRESENT: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
@@ -201,6 +204,9 @@ def _self_attn_fwd(
     softmax_scale: tl.constexpr = tl.cast(SM_SCALE * RCP_LN2, q_tile.dtype)
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
 
+    if PRESCALE:
+        q_tile *= softmax_scale
+
     max_tile = tl.cdiv(seq_len, TILE_K_SIZE)
     for kv_tile_idx in tl.range(
         0, max_tile, num_stages=PIPELINING
@@ -229,8 +235,11 @@ def _self_attn_fwd(
                 )
 
         qk = tl.dot(
-            q_tile * softmax_scale, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
+            q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
         )
+
+        if not PRESCALE:
+            qk *= softmax_scale
 
         if last_iter:
             kv_indices = kv_token_idx + tile_k_arange
@@ -292,14 +301,15 @@ def _self_attn_fwd(
     )
 # fmt: on
 
+
 def autotune_prehook(kwargs, reset_only=False):
-    if kwargs['L'] is not None:
-        kwargs['L'].add_(kwargs['q'].size(2))  # L += time
+    if kwargs["L"] is not None:
+        kwargs["L"].add_(kwargs["q"].size(2))  # L += time
 
 
 def autotune_posthook(kwargs, exception=None):
-    if kwargs['L'] is not None:
-        kwargs['L'].add_(-kwargs['q'].size(2))  # L -= time
+    if kwargs["L"] is not None:
+        kwargs["L"].add_(-kwargs["q"].size(2))  # L -= time
 
 
 streaming_forward = triton.heuristics(
@@ -324,10 +334,18 @@ streaming_forward_autotune = triton.autotune(
         for num_warps in [4, 8]
         for pipe in [1, 2]
         for tile_q in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
         for tile_k in [
-            2**i for i in range(int(math.log2(MIN_TILE_SIZE) + 0.1), int(math.log2(MAX_TILE_SIZE) + 0.1) + 1)
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
         ]
         for V_PRELOAD in (True, False)
     ],
@@ -338,25 +356,32 @@ streaming_forward_autotune = triton.autotune(
 )(_self_attn_fwd)
 
 
-@torch.library.custom_op("alexdremov_flash_attention::forward", mutates_args=(), device_types=("cuda",))
+@torch.library.custom_op(
+    "alexdremov_flash_attention::forward", mutates_args=(), device_types=("cuda",)
+)
 def attention_forward_adapter(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        lens: torch.Tensor,
-        sm_scale: float,
-        autotune: bool,
-    ) -> tuple[torch.Tensor]:
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor,
+    sm_scale: float,
+    autotune: bool,
+    prescale: bool,
+) -> torch.Tensor:
     batch, heads, T, HEAD_DIM = q.shape
 
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
     assert T == k.shape[-2] and T == v.shape[-2]
     assert sm_scale is not None
-    assert lens is None or (lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1)
+    assert lens is None or (
+        lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1
+    )
 
     O = torch.zeros_like(q, memory_format=torch.contiguous_format)
-    INPUT_PRECISION = ("tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee")
+    INPUT_PRECISION = (
+        "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
+    )
 
     grid = lambda args: (
         batch,
@@ -378,6 +403,7 @@ def attention_forward_adapter(
         *strides(O),
         *(strides(lens) if lens is not None else [0]),
         T=T,
+        PRESCALE=prescale,
         HEAD_DIM=HEAD_DIM,
         INPUT_PRECISION=INPUT_PRECISION,
         DTYPE=q.dtype,
@@ -390,19 +416,15 @@ def attention_forward_adapter(
 
 @torch.library.register_fake("alexdremov_flash_attention::forward")
 def attention_forward_adapter_abstract(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        lens: torch.Tensor | None,
-        context_size: int,
-        back_contexts: int,
-        sm_scale: float | None,
-        autotune: bool,
-        return_lse: bool,
-    ) -> tuple[torch.Tensor]:
-    return (
-        torch.empty_like(q, memory_format=torch.contiguous_format),
-    )
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lens: torch.Tensor,
+    sm_scale: float,
+    autotune: bool,
+    prescale: bool,
+) -> torch.Tensor:
+    return torch.empty_like(q, memory_format=torch.contiguous_format)
 
 
 def self_attention_reference(q, k, v, lens):
@@ -410,7 +432,9 @@ def self_attention_reference(q, k, v, lens):
 
     attn_mask = None
     if lens is not None:
-        key_padding_mask = (torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)).unsqueeze(-1)
+        key_padding_mask = (
+            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+        ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
         attn_mask = key_padding_mask.unsqueeze(1)
@@ -419,7 +443,8 @@ def self_attention_reference(q, k, v, lens):
         res_mask = torch.tensor([True], device="cuda")
 
     return (
-        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask) * res_mask,
+        F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask)
+        * res_mask,
         res_mask,
     )
 
@@ -430,7 +455,9 @@ def self_attention_reference_naive(q, k, v, lens):
 
     attn_mask = None
     if lens is not None:
-        key_padding_mask = (torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)).unsqueeze(-1)
+        key_padding_mask = (
+            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+        ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
         attn_mask = key_padding_mask.unsqueeze(1)
@@ -438,9 +465,9 @@ def self_attention_reference_naive(q, k, v, lens):
     else:
         res_mask = torch.tensor([True], device="cuda")
 
-    qkt = (q / (D ** 0.5)) @ k.transpose(-1, -2)
+    qkt = (q / (D**0.5)) @ k.transpose(-1, -2)
     if attn_mask is not None:
-        qkt = torch.where(attn_mask, qkt, -float('inf'))
+        qkt = torch.where(attn_mask, qkt, -float("inf"))
     scores = F.softmax(qkt, dim=-1)
     result = scores @ v
 
@@ -457,10 +484,11 @@ def self_attention(
     lens: torch.Tensor | None,
     sm_scale: float | None = None,
     autotune=True,
+    prescale=False,
 ):
     if sm_scale is None:
         HEAD_DIM = q.size(-1)
-        sm_scale = HEAD_DIM ** -0.5
+        sm_scale = HEAD_DIM**-0.5
     return torch.ops.alexdremov_flash_attention.forward(
         q,
         k,
@@ -468,6 +496,7 @@ def self_attention(
         lens,
         sm_scale,
         autotune,
+        prescale,
     )
 
 
@@ -488,7 +517,7 @@ if __name__ == "__main__":
         T=T,
         HEAD_DIM=D,
         dtype=torch.float32,
-        lens='none',
+        lens="none",
         noncontiguous=False,
         autotune=False,
     )
