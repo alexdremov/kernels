@@ -133,11 +133,10 @@ if __name__ == "__main__":
 
         with torch.inference_mode():
             try:
-                ms = triton.testing.do_bench(
+                ms = triton.testing.do_bench_cudagraph(
                     fn,
-                    warmup=500,
                     rep=1000,
-                    return_mode="mean",
+                    return_mode="median",
                 )
             except torch.OutOfMemoryError:
                 return 0

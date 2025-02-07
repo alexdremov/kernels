@@ -48,8 +48,8 @@ if __name__ == "__main__":
                 batch=batch,
                 back_context=9,
                 context_size=10,
-                dim=128,
-                heads=6,
+                dim=64,
+                heads=12,
                 name="relevant",
             )
             for batch in batches
@@ -77,7 +77,7 @@ if __name__ == "__main__":
             for batch in batches
         ]
     )
-    for mode in ("bwd", "fwd"):
+    for mode in ("fwd"):
         for param in params:
             line_vals = [
                 f"triton-{mode}",
@@ -288,8 +288,11 @@ if __name__ == "__main__":
                 )
 
         with torch.inference_mode() if "fwd" in provider else contextlib.nullcontext():
-            ms = triton.testing.do_bench(
-                fn, warmup=500, rep=1000, return_mode="mean", grad_to_none=(q, k, v)
+            bench = triton.testing.do_bench_cudagraph
+            if "bwd" in provider:
+                bench = triton.testing.do_bench
+            ms = bench(
+                fn, rep=1000, return_mode="median", grad_to_none=(q, k, v)
             )
 
         context_tok_size = context_size * (1 + back_contexts)

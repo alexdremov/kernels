@@ -144,19 +144,21 @@ def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
         min_pipeline = 3
         max_size = 64
     if HEAD_DIM == 64:
-        min_pipeline = 3
+        min_pipeline = 2
         max_size = 128
+        min_warps = 2
+        max_warps = 4
     elif HEAD_DIM == 128:
         max_size = 128
         min_size = 64
         max_pipeline = 2
-        min_pipeline = 2
+        min_pipeline = 1
         max_warps = 4
     elif HEAD_DIM == 256:
         max_size = 64
         min_size = 32
         max_pipeline = 2
-        min_pipeline = 2
+        min_pipeline = 1
         max_warps = 4
 
     configs = [i for i in configs if min_size <= i.kwargs["TILE_DQ_Q_SIZE"] <= max_size]
@@ -1277,6 +1279,7 @@ def attention_forward_adapter(
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
+    precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1292,19 +1295,11 @@ def attention_forward_adapter(
     O = torch.zeros_like(q, memory_format=torch.contiguous_format)
     LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
 
-    INPUT_PRECISION = "ieee"
-    if not torch.compiler.is_compiling():
-        INPUT_PRECISION = (
-            "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
-        )
-
     grid = lambda args: (
         batch,
         heads,
         triton.cdiv(T, args["TILE_Q_SIZE"]),
     )
-
-    need_grad = any(i.requires_grad for i in (q, k, v))
 
     kt = k.transpose(-1, -2)  # just stride tricks, same data
     fwd_fn = streaming_forward_autotune if autotune else streaming_forward
@@ -1325,11 +1320,11 @@ def attention_forward_adapter(
         HEAD_DIM=HEAD_DIM,
         CONTEXT_SIZE=context_size,
         CONTEXTS_BACK=back_contexts,
-        INPUT_PRECISION=INPUT_PRECISION,
+        INPUT_PRECISION=precision,
         PRESCALE_QK=prescale_qk,
         DTYPE=q.dtype,
         TIME_BUCKET=triton.next_power_of_2(T),
-        OUTPUT_LOGSUMEXP=(need_grad or return_lse),
+        OUTPUT_LOGSUMEXP=return_lse,
         SM_SCALE=sm_scale,
     )
     return O, LSE
@@ -1347,6 +1342,7 @@ def attention_forward_adapter_abstract(
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
+    precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -1370,6 +1366,7 @@ def attention_backward_adapter(
     sm_scale: float,
     autotune: bool,
     prescale_qk: bool,
+    precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1395,12 +1392,6 @@ def attention_backward_adapter(
     DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
     DK = torch.zeros_like(k, memory_format=torch.contiguous_format)
     DV = torch.zeros_like(v, memory_format=torch.contiguous_format)
-
-    INPUT_PRECISION = "ieee"
-    if not torch.compiler.is_compiling():
-        INPUT_PRECISION = (
-            "tf32" if torch.get_float32_matmul_precision() != "highest" else "ieee"
-        )
 
     grid = lambda args: (
         batch,
@@ -1435,7 +1426,7 @@ def attention_backward_adapter(
         CONTEXT_SIZE=context_size,
         CONTEXTS_BACK=back_contexts,
         TIME_BUCKET=triton.next_power_of_2(T),
-        INPUT_PRECISION=INPUT_PRECISION,
+        INPUT_PRECISION=precision,
         DTYPE=q.dtype,
         SM_SCALE=sm_scale,
         PRESCALE_QK=prescale_qk,
@@ -1458,6 +1449,7 @@ def attention_backward_adapter_abstract(
     sm_scale: float | None,
     autotune: bool,
     prescale_qk: bool,
+    precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -1478,6 +1470,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         autotune,
         return_lse,
         prescale_qk,
+        precision,
     ) = inputs
     ctx.save_for_backward(
         q,
@@ -1492,16 +1485,17 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
     ctx.autotune = autotune
     ctx.sm_scale = sm_scale
     ctx.prescale_qk = prescale_qk
+    ctx.precision = precision
 
 
-def attention_backward_adapter_op(ctx, do, *grads):
+def attention_backward_adapter_op(ctx, do, dlse):
     q, k, v, o, lse, lens = ctx.saved_tensors
     context_size = ctx.context_size
     back_contexts = ctx.back_contexts
     autotune = ctx.autotune
     sm_scale = ctx.sm_scale
     prescale_qk = ctx.prescale_qk
-    batch, heads, T, HEAD_DIM = q.shape
+    precision = ctx.precision
 
     DQ, DK, DV = torch.ops.alexdremov_streaming_attention.backward(
         q=q,
@@ -1516,9 +1510,10 @@ def attention_backward_adapter_op(ctx, do, *grads):
         sm_scale=sm_scale,
         autotune=autotune,
         prescale_qk=prescale_qk,
+        precision=precision,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -1573,18 +1568,21 @@ def _streaming_attention(
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
+    precision: str,
 ):
+    requires_grad = any(i.requires_grad for i in (q, k, v))
     O, LSE = torch.ops.alexdremov_streaming_attention.forward(
-        q,
-        k,
-        v,
-        lens,
-        context_size,
-        back_contexts,
-        sm_scale,
-        autotune,
-        return_lse,
-        prescale_qk,
+        q=q,
+        k=k,
+        v=v,
+        lens=lens,
+        context_size=context_size,
+        back_contexts=back_contexts,
+        sm_scale=sm_scale,
+        autotune=autotune,
+        prescale_qk=prescale_qk,
+        return_lse=return_lse or requires_grad,
+        precision=precision,
     )
     if return_lse:
         return O, LSE
@@ -1599,9 +1597,10 @@ def streaming_attention(
     context_size: int,
     back_contexts: int,
     sm_scale: float | None = None,
-    autotune=True,
+    autotune=False,
     return_lse=False,
     prescale_qk=False,
+    precision="ieee",
 ):
     """
     Computes block-sparse self-attention with chunked attention mask.
@@ -1622,6 +1621,7 @@ def streaming_attention(
         sm_scale (float): Softmax scale, head_dim ** -0.5 by default
         autotune (bool): Use triton autotune for optimal kernel configuration
         prescale_qk (bool): Prescale Q in QK^T calculations — slightly faster if True, slightly lower precision
+        precision (str): Precision for matmuls: 'ieee' or 'tf32'
     """
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
@@ -1641,6 +1641,7 @@ def streaming_attention(
         autotune=autotune,
         return_lse=return_lse,
         prescale_qk=prescale_qk,
+        precision=precision,
     )
 
 

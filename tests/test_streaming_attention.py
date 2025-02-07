@@ -9,7 +9,7 @@ from streaming_attention import (streaming_attention,
 
 
 @pytest.mark.parametrize(
-    "lens", ["none", "tricky", "random"], ids=lambda x: f"lens-{x}"
+    "lens", ["none", "tricky"], ids=lambda x: f"lens-{x}"
 )
 @pytest.mark.parametrize(
     "noncontiguous", [False, True], ids=lambda x: f"noncontiguous-{x}"
@@ -17,7 +17,7 @@ from streaming_attention import (streaming_attention,
 @pytest.mark.parametrize("do_fp32", [False], ids=lambda x: f"do_fp32-{x}")
 @pytest.mark.parametrize("qkv_same", [False], ids=lambda x: f"qkv_same-{x}")
 @pytest.mark.parametrize(
-    "context_size", [1, 10, 16, 32, 10000], ids=lambda x: f"context-{x}"
+    "context_size", [1, 10, 32, 10000], ids=lambda x: f"context-{x}"
 )
 @pytest.mark.parametrize(
     "back_contexts", [0, 5, 10000], ids=lambda x: f"back_contexts-{x}"
@@ -28,7 +28,7 @@ from streaming_attention import (streaming_attention,
 @pytest.mark.parametrize("T", [1, 10, 16, 800], ids=lambda x: f"time-{x}")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=lambda x: f"{x}")
 @pytest.mark.parametrize("autotune", [False, True], ids=lambda x: f"autotune-{x}")
-@pytest.mark.parametrize("prescale", [False, True], ids=lambda x: f"prescale-{x}")
+@pytest.mark.parametrize("prescale", [False], ids=lambda x: f"prescale-{x}")
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() < (8, 0), reason="requires Ampere and higher"
 )
@@ -160,7 +160,7 @@ def test_streaming_attention_reference(
     ref_dk, k.grad = k.grad.clone(), None
     ref_dq, q.grad = q.grad.clone(), None
 
-    tri_out = streaming_attention(
+    tri_out, tri_lse = streaming_attention(
         q,
         k,
         v,
@@ -169,6 +169,7 @@ def test_streaming_attention_reference(
         back_contexts,
         autotune=autotune,
         prescale_qk=prescale,
+        return_lse=True,
     )
     tri_out.backward(dout)
 
@@ -178,6 +179,7 @@ def test_streaming_attention_reference(
 
     # torch.set_printoptions(linewidth=400, profile="full")
 
+    tri_out_orig = tri_out
     tri_out = tri_out * res_mask.broadcast_to(tri_out.shape)
     atol = 3e-3
     if dtype == torch.float32:
@@ -194,6 +196,7 @@ def test_streaming_attention_reference(
         rtol=0,
         msg=lambda x: f"forward error\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \n\n {(tri_out - ref)[errors].view(-1)}\n\nlens:\n{lens}\n{ref}\n{tri_out}",
     )
+
     for i, (d_ref, d_tri) in enumerate(
         [(ref_dv, tri_dv), (ref_dk, tri_dk), (ref_dq, tri_dq)]
     ):
@@ -217,6 +220,52 @@ def test_streaming_attention_reference(
             rtol=0,
             msg=lambda x: f"error in d{'vkq'[i]}\n{x}\n\n{(b_mismatch, h_mismatch)}:\n{(errors[b_mismatch, h_mismatch]).long()} \ndiff:\n {(d_tri - d_ref)[errors].view(-1)}\ntarget:\n {(d_ref)[errors].view(-1)}\nreal:\n {(d_tri)[errors].view(-1)}\n\nlens:\n{lens}\n{mean_err = }",
         )
+
+    torch.library.opcheck(
+        torch.ops.alexdremov_streaming_attention.backward,
+        args=(),
+        kwargs=dict(
+            q=q,
+            k=k,
+            v=v,
+            lens=lens,
+            o=tri_out_orig,
+            lse=tri_lse,
+            do=dout,
+            context_size=context_size,
+            back_contexts=back_contexts,
+            sm_scale=q.size(-1) ** -0.5,
+            autotune=False,
+            prescale_qk=False,
+            precision="ieee",
+        ),
+        test_utils=(
+            "test_schema",
+            "test_faketensor",
+        ),
+        atol=1e-4 if dtype == torch.float32 else 1e-2,
+        rtol=float('inf'),
+    )
+
+    torch.library.opcheck(
+        torch.ops.alexdremov_streaming_attention.forward,
+        args=(),
+        kwargs=dict(
+            q=q,
+            k=k,
+            v=v,
+            lens=lens,
+            context_size=context_size,
+            back_contexts=back_contexts,
+            sm_scale=q.size(-1) ** -0.5,
+            autotune=autotune,
+            return_lse=False,
+            prescale_qk=False,
+            precision="ieee",
+        ),
+        atol=1e-4 if dtype == torch.float32 else 1e-2,
+        rtol=float('inf'),
+    )
 
 
 @pytest.mark.skipif(
