@@ -44,7 +44,7 @@ if __name__ == "__main__":
         batch = param["batch"]
         prescale = param["prescale"]
 
-        x_vals = np.linspace(257, 8000, 6).astype(int).tolist()
+        x_vals = np.linspace(257, 16000, 6).astype(int).tolist()
         x_vals = np.unique(x_vals)
         x_vals = sorted(x_vals)
 
@@ -56,7 +56,7 @@ if __name__ == "__main__":
                 line_vals=line_vals,
                 line_names=line_vals,
                 styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("yellow", "-")],
-                ylabel="TFLOPS",
+                ylabel="ms",
                 plot_name=f"self-attention-{param['name']}-dim-{dim}-heads-{heads}-batch-{batch}-prescale-{prescale}",
                 args=dict(
                     batch=batch,
@@ -111,8 +111,6 @@ if __name__ == "__main__":
             assert False
 
         ref, res_mask = self_attention_reference(q, k, v, lens)
-        ref, res_mask = ref.cuda(), res_mask.cuda()
-
         print(f"Starting {provider}")
 
         try:
@@ -120,7 +118,8 @@ if __name__ == "__main__":
         except torch.OutOfMemoryError:
             return 0
 
-        actual = actual * res_mask.broadcast_to(actual.shape)
+        if not isinstance(res_mask, int):
+            actual = actual * res_mask.broadcast_to(actual.shape)
 
         atol = 5e-3
         torch.testing.assert_close(
@@ -136,8 +135,9 @@ if __name__ == "__main__":
                 ms = triton.testing.do_bench_cudagraph(
                     fn,
                     rep=1000,
-                    return_mode="median",
+                    return_mode="mean",
                 )
+                return ms
             except torch.OutOfMemoryError:
                 return 0
 

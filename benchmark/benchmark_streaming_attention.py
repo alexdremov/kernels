@@ -40,7 +40,7 @@ if __name__ == "__main__":
     #     B=1, H=1, T=256, HEAD_DIM=16, context_size=257, back_contexts=0, dtype=torch.float32, lens='tricky'
     # )
     # sys.exit()
-    batches = (96,)
+    batches = (128,)
     configs = []
     params = (
         [
@@ -59,29 +59,17 @@ if __name__ == "__main__":
                 batch=batch,
                 back_context=2,
                 context_size=32,
-                dim=128,
-                heads=6,
+                dim=64,
+                heads=12,
                 name="perfect-fit",
             )
             for batch in batches
         ]
-        + [
-            dict(
-                batch=batch,
-                back_context=2,
-                context_size=256,
-                dim=256,
-                heads=6,
-                name="perfect-fit-large",
-            )
-            for batch in batches
-        ]
     )
-    for mode in ("fwd"):
+    for mode in ("bwd", "fwd"):
         for param in params:
             line_vals = [
                 f"triton-{mode}",
-                f"triton-{mode}-prescale",
                 f"flex-compile-{mode}",
                 f"torch-{mode}",
             ]
@@ -292,7 +280,7 @@ if __name__ == "__main__":
             if "bwd" in provider:
                 bench = triton.testing.do_bench
             ms = bench(
-                fn, rep=1000, return_mode="median", grad_to_none=(q, k, v)
+                fn, rep=1000, return_mode="mean", grad_to_none=(q, k, v)
             )
 
         context_tok_size = context_size * (1 + back_contexts)

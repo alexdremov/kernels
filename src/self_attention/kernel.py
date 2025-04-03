@@ -433,14 +433,14 @@ def self_attention_reference(q, k, v, lens):
     attn_mask = None
     if lens is not None:
         key_padding_mask = (
-            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+            torch.arange(T, device=q.device).unsqueeze(0) < lens.unsqueeze(-1)
         ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
         attn_mask = key_padding_mask.unsqueeze(1)
         res_mask = key_padding_mask_ref.unsqueeze(1)
     else:
-        res_mask = torch.tensor([True], device="cuda")
+        res_mask = 1
 
     return (
         F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask)
@@ -456,14 +456,14 @@ def self_attention_reference_naive(q, k, v, lens):
     attn_mask = None
     if lens is not None:
         key_padding_mask = (
-            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+            torch.arange(T, device=q.device).unsqueeze(0) < lens.unsqueeze(-1)
         ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
         attn_mask = key_padding_mask.unsqueeze(1)
         res_mask = key_padding_mask_ref.unsqueeze(1)
     else:
-        res_mask = torch.tensor([True], device="cuda")
+        res_mask = 1
 
     qkt = (q / (D**0.5)) @ k.transpose(-1, -2)
     if attn_mask is not None:
@@ -472,7 +472,7 @@ def self_attention_reference_naive(q, k, v, lens):
     result = scores @ v
 
     return (
-        torch.where(res_mask, result, 0),
+        result if isinstance(res_mask, int) else torch.where(res_mask, result, 0),
         res_mask,
     )
 

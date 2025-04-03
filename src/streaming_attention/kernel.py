@@ -85,8 +85,10 @@ def _get_default_config_bwd(head_dim, dtype) -> tuple[int, int, int, int]:
         return (16, 16, 4, 1)
 
 
-def strides(t):
+def strides(t: torch.Tensor, expected_size=None):
     assert t is not None
+    if expected_size is not None:
+        assert t.ndim == expected_size
     return [t.stride(i) for i in range(t.ndim)]
 
 
@@ -402,7 +404,7 @@ def _streaming_attn_fwd(
             boundary_check=(0,),
         )
 
-    if OUTPUT_LOGSUMEXP:
+    if OUTPUT_LOGSUMEXP and LSE is not None:
         m_i += tl.math.log2(l_i)
 
         mbatch_head_offset = batch * stride_mb + head * stride_mh
@@ -1293,7 +1295,9 @@ def attention_forward_adapter(
     )
 
     O = torch.zeros_like(q, memory_format=torch.contiguous_format)
-    LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
+    LSE = None
+    if return_lse:
+        LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
 
     grid = lambda args: (
         batch,
@@ -1310,12 +1314,12 @@ def attention_forward_adapter(
         lens,
         LSE,
         O,
-        *strides(q),
-        *strides(kt),
-        *strides(v),
-        *strides(LSE),
-        *strides(O),
-        *(strides(lens) if lens is not None else [0]),
+        *strides(q, 4),
+        *strides(kt, 4),
+        *strides(v, 4),
+        *(strides(LSE, 3) if LSE is not None else [0] * 3),
+        *strides(O, 4),
+        *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CONTEXT_SIZE=context_size,
@@ -1327,6 +1331,9 @@ def attention_forward_adapter(
         OUTPUT_LOGSUMEXP=return_lse,
         SM_SCALE=sm_scale,
     )
+
+    if LSE is None:
+        LSE = torch.empty(0)
     return O, LSE
 
 
@@ -1346,7 +1353,7 @@ def attention_forward_adapter_abstract(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
-        torch.empty(q.shape[:3], dtype=torch.float32, device=q.device),
+        torch.empty(q.shape[:3], dtype=torch.float32, device=q.device) if return_lse else torch.empty(0),
     )
 
 
@@ -1380,9 +1387,9 @@ def attention_backward_adapter(
         o,
         do,
         delta,
-        *strides(o),
-        *strides(do),
-        *strides(delta),
+        *strides(o, 4),
+        *strides(do, 4),
+        *strides(delta, 3),
         T=T,
         HEAD_DIM=HEAD_DIM,
         DTYPE=q.dtype,
@@ -1411,16 +1418,16 @@ def attention_backward_adapter(
         DQ,
         DK,
         DV,
-        *strides(q),
-        *strides(k),
-        *strides(v),
-        *strides(delta),
-        *strides(lse),
-        *strides(do),
-        *strides(DQ),
-        *strides(DK),
-        *strides(DV),
-        *(strides(lens) if lens is not None else [0]),
+        *strides(q, 4),
+        *strides(k, 4),
+        *strides(v, 4),
+        *strides(delta, 3),
+        *strides(lse, 3),
+        *strides(do, 4),
+        *strides(DQ, 4),
+        *strides(DK, 4),
+        *strides(DV, 4),
+        *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CONTEXT_SIZE=context_size,
