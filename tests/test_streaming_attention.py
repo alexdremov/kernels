@@ -243,17 +243,15 @@ def test_streaming_attention_reference(
             "test_schema",
             "test_faketensor",
         ),
-        atol=1e-4 if dtype == torch.float32 else 1e-2,
-        rtol=float('inf'),
     )
 
     torch.library.opcheck(
         torch.ops.alexdremov_streaming_attention.forward,
         args=(),
         kwargs=dict(
-            q=q,
-            k=k,
-            v=v,
+            q=q / 10,
+            k=k / 10,
+            v=v / 10,
             lens=lens,
             context_size=context_size,
             back_contexts=back_contexts,
@@ -263,8 +261,6 @@ def test_streaming_attention_reference(
             prescale_qk=False,
             precision="ieee",
         ),
-        atol=1e-4 if dtype == torch.float32 else 1e-2,
-        rtol=float('inf'),
     )
 
 
